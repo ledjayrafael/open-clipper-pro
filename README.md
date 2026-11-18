@@ -21,7 +21,10 @@
 
 ## Fitur
 
-- **Deteksi segmen viral.** AI memilih 3–10 segmen dan memberi tiap segmen `viral_score` 1–100.
+- **Deteksi segmen viral dari isi video.**
+  - Seluruh audio ditranskripsi dulu, lalu AI membaca transkrip bertimestamp untuk memilih momen terbaik.
+  - Tiap segmen mendapat `viral_score` 1–100 dan alasan singkat.
+  - Backend memvalidasi hasil AI: memotong di batas kata, menjaga durasi sesuai pilihan (15–30, 30–60, atau 60–90 detik), dan membuang segmen yang tumpang tindih.
 - **Dua mode AI.** Pilih langsung di aplikasi:
   - **OpenRouter** (cloud, default model Gemini Flash Lite).
   - **Ollama** (lokal, tanpa API key, misalnya `gemma4:e4b`).
@@ -39,17 +42,18 @@
 ```
 Browser (React + Vite)                Backend lokal (Node, port 3030)
 ──────────────────────                ────────────────────────────────
-Upload video ───────────────────────▶ simpan sementara
-Klik "Jadikan Clip Viral" ──────────▶ /api/analyze ──▶ OpenRouter  atau  Ollama (127.0.0.1:11434)
-                                      │
+Klik "Jadikan Clip Viral" ──────────▶ /api/process (upload video + pengaturan)
+                                      ├─ Groq Whisper: transkrip seluruh video (per 10 menit)
+                                      ├─ OpenRouter  atau  Ollama: pilih segmen dari transkrip
+                                      ├─ validasi: batas kata, durasi, overlap
                                       ├─ FFmpeg: potong segmen + crop 9:16
                                       ├─ MediaPipe: cari posisi wajah
                                       └─ SSE: kirim progres ke browser
-Generate Subtitle ──────────────────▶ Groq Whisper ──▶ ASS ──▶ FFmpeg burn-in
+Generate Subtitle ──────────────────▶ word timing tersimpan ──▶ ASS ──▶ FFmpeg burn-in
 Simpan Video ◀────────────────────── /outputs/*.mp4
 ```
 
-> **Catatan:** saat ini AI memilih segmen hanya berdasarkan nama file dan durasi video, bukan isi videonya. Transkrip baru dipakai di tahap subtitle.
+> **Catatan:** tanpa `GROQ_API_KEY`, atau kalau video tidak berisi ucapan, AI hanya melihat durasi video sehingga pilihannya asal tebak. Aplikasi menampilkan peringatan saat hal ini terjadi.
 
 ## Prasyarat
 
@@ -91,7 +95,8 @@ Salin `.env.example` menjadi `.env` di root project, lalu isi:
 | Variabel | Wajib | Fungsi |
 |---|---|---|
 | `OPENROUTER_API_KEY` | untuk mode OpenRouter | Analisis segmen lewat cloud |
-| `GROQ_API_KEY` | opsional | Transkripsi Whisper. Tanpa key ini, subtitle memakai caption buatan AI. |
+| `GROQ_API_KEY` | sangat disarankan | Transkripsi Whisper. Dipakai AI untuk memilih segmen dan untuk subtitle. Tanpa key ini, AI hanya melihat durasi video. |
+| `WHISPER_LANGUAGE` | opsional | Bahasa audio, default `id`. Kosongkan (`WHISPER_LANGUAGE=`) untuk deteksi otomatis. |
 | `OPENROUTER_MODEL` | opsional | Default `google/gemini-3.1-flash-lite-preview` |
 | `AI_PROVIDER` | opsional | Mode awal: `openrouter` atau `ollama` |
 | `OLLAMA_URL` | opsional | Default `http://127.0.0.1:11434` |
@@ -107,7 +112,7 @@ ollama pull gemma4:e4b
 ollama serve
 ```
 
-Di aplikasi, pilih **Mode AI → Ollama**, lalu pilih modelnya. Model lokal lebih lambat dari cloud. Untuk model kecil, backend memaksa jawaban mengikuti JSON schema supaya selalu menghasilkan 3–10 segmen.
+Di aplikasi, pilih **Mode AI → Ollama**, lalu pilih modelnya. Model lokal lebih lambat dari cloud. Untuk model kecil, backend memaksa jawaban mengikuti JSON schema dan memperpanjang segmen yang terlalu pendek sampai durasi minimum. Transkripsi tetap memakai Groq, jadi mode Ollama tidak sepenuhnya offline.
 
 ## Menjalankan
 
@@ -127,7 +132,7 @@ Lalu buka <http://localhost:5173>.
 
 1. **Pilih video.** Upload MP4, MOV, AVI, atau WebM.
 2. **Preview.** Cek video sumber.
-3. **Proses.** Pilih mode AI, nyalakan atau matikan *Auto Face Detection*, lalu klik **Jadikan Clip Viral**.
+3. **Proses.** Pilih mode AI, jumlah clip, dan durasi per clip. Nyalakan atau matikan *Auto Face Detection*, lalu klik **Jadikan Clip Viral**.
 4. **Atur subtitle per clip.** Sesuaikan ukuran dan posisi Y, lalu klik **Generate Subtitle**.
 5. **Simpan Video.** Unduh clip yang sudah jadi.
 
@@ -157,8 +162,8 @@ vite.config.js                   proxy /api dan /outputs ke backend
 
 Video diproses di komputer kamu sendiri. Ada dua hal yang keluar dari komputer:
 
-- Ke OpenRouter: prompt analisis, yaitu nama file dan durasi video. Ini tidak terjadi di mode Ollama.
-- Ke Groq: audio clip, kalau `GROQ_API_KEY` diisi.
+- Ke Groq: seluruh audio video untuk transkripsi, kalau `GROQ_API_KEY` diisi. Ini juga berlaku di mode Ollama.
+- Ke OpenRouter: transkrip dan durasi video. Ini tidak terjadi di mode Ollama.
 
 Proses hanya video yang kamu miliki atau punya hak untuk mengeditnya.
 

@@ -28,7 +28,12 @@ const OLLAMA_URL = (process.env.OLLAMA_URL || 'http://127.0.0.1:11434').replace(
 const OLLAMA_MODEL = process.env.OLLAMA_MODEL || '';
 const AI_PROVIDER = process.env.AI_PROVIDER === 'ollama' ? 'ollama' : 'openrouter';
 if (!OPENROUTER_API_KEY) console.warn('OPENROUTER_API_KEY belum diset (lihat .env.example). Mode OpenRouter tidak tersedia; mode Ollama tetap bisa dipakai.');
-if (!GROQ_API_KEY) console.warn('GROQ_API_KEY belum diset. Subtitle memakai caption AI, bukan transkripsi.');
+// Whisper language hint; set WHISPER_LANGUAGE= (empty) in .env for auto-detect.
+const WHISPER_LANGUAGE = process.env.WHISPER_LANGUAGE ?? 'id';
+// Full-video transcription is sent to Groq in chunks of this many seconds.
+const WHISPER_CHUNK_SECONDS = 600;
+const WORDS_DIR_NAME = '.words';
+if (!GROQ_API_KEY) console.warn('GROQ_API_KEY belum diset. AI hanya melihat durasi video (tanpa transkrip) dan subtitle memakai caption AI.');
 
 const httpError = (statusCode, message) => Object.assign(new Error(message), { statusCode });
 
@@ -50,6 +55,10 @@ async function callOpenRouter(messages) {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${OPENROUTER_API_KEY}` },
     body: JSON.stringify({ model: OPENROUTER_MODEL, messages, response_format: { type: 'json_object' } }),
+    signal: AbortSignal.timeout(180000),
+  }).catch(error => {
+    if (error.name === 'TimeoutError') throw httpError(504, 'OpenRouter tidak menjawab dalam 3 menit. Coba lagi.');
+    throw httpError(502, `Gagal menghubungi OpenRouter: ${error.message}`);
   });
   if (!response.ok) {
     const errText = await response.text().catch(() => '');
@@ -60,33 +69,32 @@ async function callOpenRouter(messages) {
 }
 
 // Structured-output schema for Ollama. With plain format:'json' small local
-// models often answer {"moments":[]}; the schema forces 3-10 real segments.
-const MOMENTS_SCHEMA = {
-  type: 'object',
-  required: ['moments'],
-  properties: {
-    moments: {
-      type: 'array', minItems: 3, maxItems: 10,
+// models often answer {"moments":[]}; the schema forces real segments.
+// Captions are only asked for when there is no transcript to take them from.
+const momentsSchema = (count, withCaptions) => {
+  const required = ['start', 'end', 'title', 'viral_score', 'reason'];
+  const properties = {
+    start: { type: 'number' }, end: { type: 'number' }, title: { type: 'string' },
+    viral_score: { type: 'integer' }, reason: { type: 'string' },
+  };
+  if (withCaptions) {
+    required.push('captions');
+    properties.captions = {
+      type: 'array', minItems: 1,
       items: {
-        type: 'object',
-        required: ['id', 'start', 'end', 'title', 'viral_score', 'captions'],
-        properties: {
-          id: { type: 'integer' }, start: { type: 'number' }, end: { type: 'number' },
-          title: { type: 'string' }, viral_score: { type: 'integer' },
-          captions: {
-            type: 'array', minItems: 1,
-            items: {
-              type: 'object', required: ['text', 'start_offset', 'end_offset'],
-              properties: { text: { type: 'string' }, start_offset: { type: 'number' }, end_offset: { type: 'number' } },
-            },
-          },
-        },
+        type: 'object', required: ['text', 'start_offset', 'end_offset'],
+        properties: { text: { type: 'string' }, start_offset: { type: 'number' }, end_offset: { type: 'number' } },
       },
-    },
-  },
+    };
+  }
+  return {
+    type: 'object',
+    required: ['moments'],
+    properties: { moments: { type: 'array', minItems: 1, maxItems: count, items: { type: 'object', required, properties } } },
+  };
 };
 
-async function callOllama(messages, requestedModel) {
+async function callOllama(messages, requestedModel, { schema, numCtx } = {}) {
   const models = await listOllamaModels();
   if (models === null) throw httpError(502, `Ollama tidak jalan di ${OLLAMA_URL}. Jalankan "ollama serve" dulu.`);
   if (models.length === 0) throw httpError(502, 'Belum ada model Ollama. Jalankan misalnya "ollama pull gemma4:e4b".');
@@ -98,7 +106,10 @@ async function callOllama(messages, requestedModel) {
     response = await fetch(`${OLLAMA_URL}/api/chat`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model, messages, stream: false, format: MOMENTS_SCHEMA, think: false, options: { temperature: 0.4 } }),
+      body: JSON.stringify({
+        model, messages, stream: false, format: schema || 'json', think: false,
+        options: { temperature: 0.4, ...(numCtx ? { num_ctx: numCtx } : {}) },
+      }),
       signal: AbortSignal.timeout(300000),
     });
   } catch (error) {
@@ -114,7 +125,345 @@ async function callOllama(messages, requestedModel) {
   return String(result.message?.content || '').replace(/<think>[\s\S]*?<\/think>/g, '').trim();
 }
 
+// ---------------------------------------------------------------------------
+// Transcript-based highlight detection
+// ---------------------------------------------------------------------------
+
+const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
+
+// Usable length of the video. When the video track ends before the audio,
+// clips past that point would have no picture, so the shorter one wins.
+// Containers without per-stream durations (mkv, webm) fall back to the format's.
+const probeDuration = async (filePath) => {
+  const read = async (args) => {
+    const { stdout } = await runCommand('ffprobe', ['-v', 'error', ...args, '-of', 'default=nw=1:nk=1', filePath]);
+    return Number(stdout.trim().split('\n')[0]) || 0;
+  };
+  const format = await read(['-show_entries', 'format=duration']);
+  const video = await read(['-select_streams', 'v:0', '-show_entries', 'stream=duration']).catch(() => 0);
+  return video > 0 && (!format || video < format) ? video : format;
+};
+
+async function groqTranscribe(audioPath, mimeType, fileName) {
+  const formData = new FormData();
+  formData.append('file', new Blob([await fsp.readFile(audioPath)], { type: mimeType }), fileName);
+  formData.append('model', 'whisper-large-v3-turbo');
+  formData.append('response_format', 'verbose_json');
+  formData.append('timestamp_granularities[]', 'word');
+  formData.append('timestamp_granularities[]', 'segment');
+  if (WHISPER_LANGUAGE) formData.append('language', WHISPER_LANGUAGE);
+
+  const response = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${GROQ_API_KEY}` },
+    body: formData,
+    signal: AbortSignal.timeout(300000),
+  });
+  if (!response.ok) {
+    const errText = await response.text().catch(() => '');
+    throw new Error(`Groq Whisper error ${response.status}: ${errText.slice(0, 300)}`);
+  }
+  const result = await response.json();
+  return { words: result.words || [], segments: result.segments || [], text: result.text || '' };
+}
+
+// Transcribe the whole video in chunks. Returns absolute-time words and lines.
+async function transcribeFullVideo(videoPath, tempDir, duration, onChunk) {
+  const words = [];
+  const segments = [];
+  const chunks = Math.max(1, Math.ceil(duration / WHISPER_CHUNK_SECONDS));
+  for (let i = 0; i < chunks; i++) {
+    const offset = i * WHISPER_CHUNK_SECONDS;
+    const audioPath = path.join(tempDir, `audio_${i}.ogg`);
+    // Opus at 32 kbps keeps a 10-minute chunk around 2.4 MB, far under Groq's upload limit.
+    await runCommand('ffmpeg', [
+      '-y', '-ss', String(offset), '-t', String(WHISPER_CHUNK_SECONDS), '-i', videoPath,
+      '-vn', '-ac', '1', '-ar', '16000', '-c:a', 'libopus', '-b:a', '32k', audioPath,
+    ]);
+    const result = await groqTranscribe(audioPath, 'audio/ogg', 'audio.ogg');
+    await fsp.unlink(audioPath).catch(() => {});
+    for (const w of result.words) {
+      const text = String(w.word || '').trim();
+      if (text) words.push({ word: text, start: Number(w.start) + offset, end: Number(w.end) + offset });
+    }
+    for (const s of result.segments) {
+      const text = String(s.text || '').trim();
+      if (text) segments.push({ text, start: Number(s.start) + offset, end: Number(s.end) + offset });
+    }
+    onChunk?.(i + 1, chunks);
+  }
+  // Drop speech past the usable video length (audio can outlast the picture).
+  const usableWords = words.filter(w => w.start < duration);
+  const usableLines = segments.filter(s => s.start < duration);
+  return { words: usableWords, lines: usableLines.length ? usableLines : linesFromWords(usableWords) };
+}
+
+// Fallback when Whisper returns words but no segments.
+const linesFromWords = (words) => {
+  const lines = [];
+  let current = null;
+  for (const w of words) {
+    if (!current || w.start - current.end > 1 || current.count >= 14) {
+      current = { text: '', start: w.start, end: w.end, count: 0 };
+      lines.push(current);
+    }
+    current.text += (current.text ? ' ' : '') + w.word;
+    current.end = w.end;
+    current.count++;
+  }
+  return lines.map(({ text, start, end }) => ({ text, start, end }));
+};
+
+const formatTranscript = (lines) => lines
+  .map(l => `[${l.start.toFixed(1)}-${l.end.toFixed(1)}] ${l.text}`)
+  .join('\n');
+
+const buildTranscriptPrompt = ({ duration, requestCount, minDur, maxDur }) => `You are a top-tier short-form video editor cutting viral clips for TikTok, Instagram Reels and YouTube Shorts.
+
+The user message is the full transcript of a ${Math.round(duration)}-second video. Each line is "[start-end] text", times in seconds.
+
+TASK: return ${requestCount} candidate segments, best first.
+
+PICK segments that have:
+1. Conflict, tension or controversy.
+2. A personal confession or a vulnerable moment.
+3. A bold opinion or a sharp statement.
+4. A punchline or a genuinely funny beat.
+5. A complete story arc: setup, build-up, payoff.
+6. An opening sentence that works as a hook on its own.
+
+AVOID greetings, intros and outros, small talk, sponsor reads, topic transitions without a payoff, and long dry explanations. When in doubt, choose emotion and conflict over neutral information.
+
+Read the WHOLE transcript before choosing. The best moments are rarely all at the start: spread your picks across the full runtime.
+
+RULES:
+- Every segment lasts ${minDur}-${maxDur} seconds; aim for about ${Math.round((minDur + maxDur) / 2)}. Compute length from the timestamps, never from how much text there is.
+- "start" is the start time of a line where a sentence begins. "end" is the end time of a line where the thought is finished. Copy times from the transcript; never invent times and never cut mid-sentence.
+- Segments must not overlap.
+- "viral_score" is 1-100. Be honest and spread the scores; do not give everything 90.
+- "title": a short catchy title (max 8 words), casual spoken style.
+- "reason": one short sentence on why this segment would go viral.
+- LANGUAGE: write "title" and "reason" in the SAME language as the transcript. An Indonesian transcript gets Indonesian titles and reasons. Use English only if the transcript itself is English.
+
+Output ONLY JSON, no prose:
+{"moments":[{"start":12.4,"end":58.9,"title":"...","viral_score":87,"reason":"..."}]}`;
+
+// Used when no transcript is available: the AI only knows the duration.
+const buildMetadataPrompt = ({ duration, requestCount, minDur, maxDur }) => `Anda adalah ahli editor video viral profesional.
+Video berdurasi ${Math.round(duration)} detik. Temukan ${requestCount} segmen terbaik untuk clip viral vertikal (Reels/TikTok/Shorts).
+ATURAN:
+- start dan end dalam detik, rentang 0-${Math.round(duration)}
+- Durasi tiap segmen ${minDur}-${maxDur} detik, TIDAK overlap
+- Setiap segmen WAJIB punya "viral_score" (1-100) dan "reason" (satu kalimat)
+- Setiap segmen WAJIB punya array 'captions' (4-6 caption per segmen, maks 8 kata per caption)
+- Caption: text, start_offset, end_offset (relatif dari start segmen, detik)
+- Urutkan dari viral_score tertinggi ke terendah
+Format JSON MURNI:
+{"moments":[{"start":0,"end":20,"title":"Hook Awal","viral_score":85,"reason":"...","captions":[{"text":"INI DIA RAHASIANYA","start_offset":0,"end_offset":4}]}]}`;
+
+// Index of the brace closing the object that opens at `start`, or -1.
+const matchBrace = (text, start) => {
+  let depth = 0;
+  let inString = false;
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i];
+    if (inString) {
+      if (ch === '\\') i++;
+      else if (ch === '"') inString = false;
+    } else if (ch === '"') inString = true;
+    else if (ch === '{') depth++;
+    else if (ch === '}' && --depth === 0) return i;
+  }
+  return -1;
+};
+
+// Parse the model's moments, salvaging readable objects if the JSON is broken
+// (models often emit one unescaped quote, which would otherwise sink the run).
+const parseMomentsJson = (content) => {
+  const raw = String(content || '').replace(/```(?:json)?/gi, '');
+  const first = raw.indexOf('{');
+  const last = raw.lastIndexOf('}');
+  if (first !== -1 && last > first) {
+    try {
+      const parsed = JSON.parse(raw.slice(first, last + 1));
+      const list = Array.isArray(parsed) ? parsed : parsed.moments;
+      if (Array.isArray(list)) return list;
+    } catch { /* fall through to salvage */ }
+  }
+  const recovered = [];
+  let index = 0;
+  while ((index = raw.indexOf('{', index)) !== -1) {
+    const close = matchBrace(raw, index);
+    if (close !== -1) {
+      try {
+        const obj = JSON.parse(raw.slice(index, close + 1));
+        if (obj && obj.start !== undefined && obj.end !== undefined) {
+          recovered.push(obj);
+          index = close + 1;
+          continue;
+        }
+      } catch { /* broken object: try the next brace */ }
+    }
+    index++;
+  }
+  return recovered;
+};
+
+// Move a cut onto word boundaries so clips never start or end mid-word.
+const snapToWords = (start, end, words, duration) => {
+  const firstWord = words.find(w => w.end > start);
+  let lastWord = null;
+  for (const w of words) {
+    if (w.start < end) lastWord = w;
+    else break;
+  }
+  if (!firstWord || !lastWord || lastWord.end <= firstWord.start) return { start, end };
+  return {
+    start: Math.max(0, firstWord.start - 0.15),
+    end: Math.min(duration, lastWord.end + 0.3),
+  };
+};
+
+// A word belongs to the clip when its midpoint is inside it, so a word cut
+// off at the clip's edge does not show up as a caption.
+const wordsInRange = (words, start, end) => words
+  .filter(w => (w.start + w.end) / 2 >= start && (w.start + w.end) / 2 < end)
+  .map(w => ({ word: w.word, start: Math.max(0, w.start - start), end: Math.min(end, w.end) - start }));
+
+// Group clip-relative words into short subtitle lines for a narrow 9:16 frame.
+// Whisper word times can overlap, so each line starts after the previous one
+// ends; otherwise two lines would be on screen at once.
+const wordsToCaptions = (words, wordsPerLine = 2) => {
+  const captions = [];
+  let previousEnd = 0;
+  for (let i = 0; i < words.length; i += wordsPerLine) {
+    const chunk = words.slice(i, i + wordsPerLine);
+    const start = Math.max(chunk[0].start, previousEnd);
+    const end = Math.max(chunk[chunk.length - 1].end, start + 0.25);
+    captions.push({
+      text: chunk.map(w => w.word).join(' '),
+      start_offset: Number(start.toFixed(2)),
+      end_offset: Number(end.toFixed(2)),
+    });
+    previousEnd = end;
+  }
+  return captions;
+};
+
+// Turn raw AI moments into the final clip list: clamp, snap, enforce the
+// duration window, drop overlaps, keep the best `count` by viral score.
+const DURATION_TOLERANCE = 3;
+const validateMoments = (rawMoments, { duration, minDur, maxDur, count, words, lines = [] }) => {
+  const stats = { received: rawMoments.length, tooShort: 0, extended: 0, trimmed: 0, overlap: 0, invalid: 0 };
+  const candidates = [];
+
+  for (const m of rawMoments) {
+    let start = Number(m.start);
+    let end = Number(m.end);
+    if (!Number.isFinite(start) || !Number.isFinite(end)) { stats.invalid++; continue; }
+    start = clamp(start, 0, duration);
+    end = clamp(end, 0, duration);
+    if (end <= start) { stats.invalid++; continue; }
+    if (words.length) ({ start, end } = snapToWords(start, end, words, duration));
+
+    if (end - start > maxDur + DURATION_TOLERANCE) {
+      // Too long: keep the opening (where the hook is) and end on a word.
+      const limit = start + maxDur;
+      const lastWord = [...words].reverse().find(w => w.end <= limit && w.start > start);
+      end = lastWord ? Math.min(duration, lastWord.end + 0.3) : limit;
+      stats.trimmed++;
+    }
+    if (end - start < minDur - DURATION_TOLERANCE) {
+      // Too short (small models often pick a single line): keep the opening
+      // and extend to the end of the transcript line that reaches minDur.
+      const target = start + minDur;
+      const line = lines.find(l => l.end >= target);
+      end = line && line.end - start <= maxDur + DURATION_TOLERANCE ? line.end : Math.min(duration, target);
+      if (end - start < minDur - DURATION_TOLERANCE) start = Math.max(0, end - minDur);
+      stats.extended++;
+    }
+    if (end - start < minDur - DURATION_TOLERANCE) { stats.tooShort++; continue; }
+
+    const rawCaptions = Array.isArray(m.captions) ? m.captions : [];
+    candidates.push({
+      start, end,
+      title: String(m.title || '').trim().slice(0, 80) || 'Clip viral',
+      reason: String(m.reason || '').trim().slice(0, 240),
+      viralScore: clamp(Math.round(Number(m.viral_score) || 50), 1, 100),
+      rawCaptions,
+    });
+  }
+
+  candidates.sort((a, b) => b.viralScore - a.viralScore);
+  const picked = [];
+  for (const c of candidates) {
+    if (picked.some(p => c.start < p.end - 1 && c.end > p.start + 1)) { stats.overlap++; continue; }
+    picked.push(c);
+    if (picked.length >= count) break;
+  }
+
+  const moments = picked.map((c, index) => {
+    const clipDuration = Number((c.end - c.start).toFixed(2));
+    const clipWords = words.length ? wordsInRange(words, c.start, c.end) : [];
+    let captions;
+    if (clipWords.length) {
+      captions = wordsToCaptions(clipWords);
+    } else if (c.rawCaptions.length) {
+      const slot = clipDuration / c.rawCaptions.length;
+      captions = c.rawCaptions.map((cap, i) => ({
+        text: String(cap.text || '').trim() || c.title,
+        start_offset: Number((i * slot).toFixed(2)),
+        end_offset: Number(((i + 1) * slot - 0.05).toFixed(2)),
+      }));
+    } else {
+      captions = [{ text: c.title, start_offset: 0, end_offset: clipDuration }];
+    }
+    return {
+      id: index + 1, title: c.title, reason: c.reason, viralScore: c.viralScore,
+      start: Number(c.start.toFixed(2)), end: Number(c.end.toFixed(2)), duration: clipDuration,
+      captions, words: clipWords,
+    };
+  });
+  return { moments, stats };
+};
+
+async function findMoments({ provider, model, duration, transcript, count, minDur, maxDur, words, lines }) {
+  const requestCount = Math.min(15, count + 3); // over-request, then filter
+  const settings = { duration, requestCount, minDur, maxDur };
+  const messages = transcript
+    ? [
+        { role: 'system', content: buildTranscriptPrompt(settings) },
+        { role: 'user', content: `TRANSCRIPT:\n${transcript}` },
+      ]
+    : [
+        { role: 'system', content: buildMetadataPrompt(settings) },
+        { role: 'user', content: `Temukan ${requestCount} segmen paling viral dari video berdurasi ${Math.round(duration)} detik.` },
+      ];
+
+  let content;
+  if (provider === 'ollama') {
+    // Ollama silently drops the start of a prompt longer than num_ctx, so size it to the transcript.
+    const promptChars = messages.reduce((n, m) => n + m.content.length, 0);
+    const numCtx = clamp(Math.ceil(promptChars / 3) + 4096, 8192, 32768);
+    content = await callOllama(messages, model, { schema: momentsSchema(requestCount, !transcript), numCtx });
+  } else {
+    content = await callOpenRouter(messages);
+  }
+
+  const raw = parseMomentsJson(content);
+  if (raw.length === 0) throw new Error('AI tidak mengembalikan segmen yang bisa dibaca. Coba lagi atau ganti model.');
+  const result = validateMoments(raw, { duration, minDur, maxDur, count, words, lines });
+  if (result.moments.length === 0) {
+    const s = result.stats;
+    throw new Error(`Semua ${s.received} segmen dari AI tidak lolos validasi (terlalu pendek: ${s.tooShort}, tidak valid: ${s.invalid}, overlap: ${s.overlap}). Coba rentang durasi lain atau ganti model.`);
+  }
+  return result;
+}
+
 await fsp.mkdir(OUTPUT_DIR, { recursive: true });
+const WORDS_DIR = path.join(OUTPUT_DIR, WORDS_DIR_NAME);
+await fsp.mkdir(WORDS_DIR, { recursive: true });
+const wordsFileFor = (clipFilename) => path.join(WORDS_DIR, `${path.basename(clipFilename)}.json`);
 
 const sendJson = (res, statusCode, payload) => {
   res.writeHead(statusCode, {
@@ -393,34 +742,6 @@ const buildFilter = (captions, subtitleSize, subtitleY, fontPath) => {
   return filters.join(',');
 };
 
-const normalizeMoments = (moments) => {
-  if (!Array.isArray(moments)) return [];
-  return moments.slice(0, 5).map((moment, index) => {
-    const start = Math.max(0, Number(moment.start || 0));
-    const end = Math.max(start + 1, Number(moment.end || start + 15));
-    const duration = end - start;
-    const captions = Array.isArray(moment.captions) && moment.captions.length > 0
-      ? moment.captions.map((caption, captionIndex, all) => {
-          const segment = duration / all.length;
-          return {
-            text: caption.text || `CLIP ${index + 1}`,
-            start_offset: Number.isFinite(Number(caption.start_offset)) ? Number(caption.start_offset) : Number((captionIndex * segment).toFixed(2)),
-            end_offset: Number.isFinite(Number(caption.end_offset)) ? Number(caption.end_offset) : Number((((captionIndex + 1) * segment) - 0.05).toFixed(2)),
-          };
-        })
-      : [{ text: moment.title || `CLIP ${index + 1}`, start_offset: 0, end_offset: duration }];
-
-    return {
-      id: index + 1,
-      title: moment.title || `Clip ${index + 1}`,
-      start,
-      end,
-      duration,
-      captions,
-    };
-  });
-};
-
 const parseMultipart = (req) => new Promise((resolve, reject) => {
   const busboy = Busboy({ headers: req.headers });
   const fields = {};
@@ -460,10 +781,58 @@ const removeDirSafe = async (dirPath) => {
   }
 };
 
-const processJob = async (jobId, videoPath, moments, tempDir, fields = {}) => {
+// Settings sent by the browser, clamped to sane values.
+const readJobSettings = (fields) => {
+  const count = clamp(Math.round(Number(fields.clip_count) || 5), 1, 10);
+  let minDur = clamp(Math.round(Number(fields.min_duration) || 30), 5, 170);
+  let maxDur = clamp(Math.round(Number(fields.max_duration) || 60), 10, 180);
+  if (maxDur <= minDur) maxDur = minDur + 10;
+  return {
+    count, minDur, maxDur,
+    provider: fields.provider === 'ollama' ? 'ollama' : fields.provider === 'openrouter' ? 'openrouter' : AI_PROVIDER,
+    model: fields.model ? String(fields.model) : undefined,
+  };
+};
+
+const processJob = async (jobId, videoPath, tempDir, fields = {}) => {
   const created = [];
-  const totalClips = moments.length;
+  const progress = (step, detail, percent) => sendSseEvent(jobId, 'progress', { step, detail, percent });
   try {
+    const settings = readJobSettings(fields);
+    progress('Membaca video', 'Mengecek durasi...', 2);
+    const duration = await probeDuration(videoPath);
+    if (!duration) throw new Error('Durasi video tidak terbaca. Pastikan file video valid.');
+
+    // Phase 1: transcript of the whole video, so the AI picks from real content.
+    let words = [];
+    let lines = [];
+    let notice = '';
+    if (GROQ_API_KEY) {
+      progress('Transkripsi audio', 'Mengirim audio ke Groq Whisper...', 5);
+      try {
+        ({ words, lines } = await transcribeFullVideo(videoPath, tempDir, duration, (done, total) => {
+          progress('Transkripsi audio', `Bagian ${done} / ${total} selesai`, Math.round(5 + (done / total) * 25));
+        }));
+        if (words.length === 0) notice = 'Tidak ada ucapan yang terdeteksi, jadi AI hanya melihat durasi video.';
+      } catch (error) {
+        console.error('Full transcription failed:', error.message);
+        notice = `Transkripsi gagal (${error.message.slice(0, 120)}), jadi AI hanya melihat durasi video.`;
+        words = [];
+        lines = [];
+      }
+    } else {
+      notice = 'GROQ_API_KEY belum diset, jadi AI hanya melihat durasi video, bukan isinya.';
+    }
+
+    // Phase 2: AI picks segments, the backend validates them.
+    const transcript = lines.length ? formatTranscript(lines) : '';
+    const aiName = settings.provider === 'ollama' ? `Ollama${settings.model ? ` · ${settings.model}` : ''}` : 'OpenRouter';
+    progress(`Analisis AI (${aiName})`, transcript ? `Membaca transkrip ${words.length} kata...` : 'Mencari segmen viral...', 32);
+    const { moments, stats } = await findMoments({ ...settings, duration, transcript, words, lines });
+    progress('Analisis AI', `${moments.length} segmen dipilih dari ${stats.received} kandidat`, 40);
+
+    // Phase 3: cut the clips.
+    const totalClips = moments.length;
     for (let i = 0; i < moments.length; i++) {
       const moment = moments[i];
       const clipDuration = moment.duration;
@@ -471,23 +840,22 @@ const processJob = async (jobId, videoPath, moments, tempDir, fields = {}) => {
       sendSseEvent(jobId, 'progress', {
         step: `Clip ${i + 1} / ${totalClips}: ${moment.title}`,
         detail: 'Memotong clip...',
-        percent: Math.round(20 + (i / totalClips) * 75),
+        percent: Math.round(40 + (i / totalClips) * 58),
       });
 
       const outputFile = `plain_${sanitizeName(moment.title)}_${moment.id}_${Date.now()}.mp4`;
       const outputPath = path.join(OUTPUT_DIR, outputFile);
 
-      // Extract a sample frame for face detection
-      const framePath = path.join(tempDir, `frame_${moment.id}.jpg`);
-      const sampleSec = Math.max(0, Math.min(moment.start + 1, moment.start + Math.max(0.5, Math.floor(clipDuration / 2))));
-      await runCommand('ffmpeg', ['-y', '-ss', String(sampleSec), '-i', videoPath, '-vframes', '1', '-q:v', '2', framePath]);
-
       // Default: center crop
       let vf = 'crop=ih*(9/16):ih:(iw-ow)/2:0';
 
-      // Only attempt face detection if not explicitly disabled by client
+      // Only attempt face detection if not explicitly disabled by client.
+      // Any failure here (frame grab or Python) falls back to the center crop.
       if (!fields || fields.face_detection !== '0') {
         try {
+          const framePath = path.join(tempDir, `frame_${moment.id}.jpg`);
+          const sampleSec = Math.max(0, Math.min(moment.start + 1, moment.start + Math.max(0.5, Math.floor(clipDuration / 2))));
+          await runCommand('ffmpeg', ['-y', '-ss', String(sampleSec), '-i', videoPath, '-vframes', '1', '-q:v', '2', framePath]);
           const py = spawnSync('python', [path.join(ROOT_DIR, 'server', 'face_detect.py'), framePath], { encoding: 'utf8', maxBuffer: 10 * 1024 * 1024 });
           if (py && py.stdout) {
             try {
@@ -531,7 +899,7 @@ const processJob = async (jobId, videoPath, moments, tempDir, fields = {}) => {
 
       await runCommandWithProgress('ffmpeg', args, {}, (processedSeconds) => {
         const clipPct = Math.min(1, processedSeconds / Math.max(clipDuration, 0.1));
-        const overall = Math.round(20 + ((i + clipPct) / totalClips) * 75);
+        const overall = Math.round(40 + ((i + clipPct) / totalClips) * 58);
         sendSseEvent(jobId, 'progress', {
           step: `Clip ${i + 1} / ${totalClips}: ${moment.title}`,
           detail: `${Math.round(clipPct * 100)}% selesai`,
@@ -546,10 +914,22 @@ const processJob = async (jobId, videoPath, moments, tempDir, fields = {}) => {
         url: `/outputs/${encodeURIComponent(outputFile)}`,
         captions: moment.captions,
         duration: clipDuration,
+        start: moment.start,
+        end: moment.end,
+        viralScore: moment.viralScore,
+        reason: moment.reason,
       });
+
+      // Keep word timing so the subtitle step needs no second transcription.
+      if (moment.words.length) {
+        await fsp.writeFile(wordsFileFor(outputFile), JSON.stringify(moment.words), 'utf-8');
+      }
     }
 
-    const result = { ok: true, clips: created, mode: 'system-ffmpeg' };
+    const result = {
+      ok: true, clips: created, mode: 'system-ffmpeg',
+      analysis: { source: words.length ? 'transcript' : 'duration', words: words.length, notice, stats },
+    };
     jobResults.set(jobId, result);
     sendSseEvent(jobId, 'done', result);
     const client = sseClients.get(jobId);
@@ -572,7 +952,10 @@ const addSubtitleJob = async (jobId, inputPath, captions, subtitleSize, subtitle
   try {
     // Step 1: Transcribe actual audio if Groq API key is available
     let finalCaptions = captions;
-    if (GROQ_API_KEY) {
+    const storedWords = await fsp.readFile(wordsFileFor(inputPath), 'utf-8').then(JSON.parse).catch(() => null);
+    if (Array.isArray(storedWords) && storedWords.length) {
+      finalCaptions = wordsToCaptions(storedWords);
+    } else if (GROQ_API_KEY) {
       sendSseEvent(jobId, 'progress', { step: 'Transkripsi audio...', detail: 'Mengenali kata-kata dalam audio...', percent: 5 });
       try {
         const transcribed = await transcribeClipAudio(inputPath, clipDuration);
@@ -741,11 +1124,10 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
-      const moments = normalizeMoments(JSON.parse(fields.moments || '[]'));
       const jobId = `job_${++jobCounter}_${Date.now()}`;
 
       jobResults.set(jobId, null); // mark as in-progress
-      processJob(jobId, videoPath, moments, tempDir, fields);
+      processJob(jobId, videoPath, tempDir, fields);
       sendJson(res, 200, { ok: true, jobId });
     } catch (error) {
       if (parsed?.tempDir) {
@@ -753,27 +1135,6 @@ const server = http.createServer(async (req, res) => {
       }
       sendJson(res, 500, { ok: false, error: error.message || 'Processing gagal.' });
     }
-    return;
-  }
-
-  if (req.method === 'POST' && req.url === '/api/analyze') {
-    let body = '';
-    req.on('data', chunk => { body += chunk.toString(); });
-    req.on('end', async () => {
-      try {
-        const { systemPrompt, userPrompt, provider, model } = JSON.parse(body);
-        const messages = [
-          { role: 'system', content: String(systemPrompt || '') },
-          { role: 'user', content: String(userPrompt || '') },
-        ];
-        const content = (provider || AI_PROVIDER) === 'ollama'
-          ? await callOllama(messages, model)
-          : await callOpenRouter(messages);
-        sendJson(res, 200, { ok: true, content });
-      } catch (error) {
-        sendJson(res, error.statusCode || 500, { ok: false, error: error.message || 'Analisis AI gagal.' });
-      }
-    });
     return;
   }
 

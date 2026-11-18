@@ -12,14 +12,12 @@ const writePref = (key, value) => {
   try { if (value) localStorage.setItem(key, value); } catch { /* storage unavailable */ }
 };
 
-// Small local models sometimes wrap JSON in prose or ``` fences.
-const parseAiJson = (text) => {
-  const raw = String(text || '');
-  const start = raw.indexOf('{');
-  const end = raw.lastIndexOf('}');
-  if (start === -1 || end <= start) throw new Error('Jawaban AI bukan JSON yang valid.');
-  return JSON.parse(raw.slice(start, end + 1));
-};
+// Clip length presets in seconds; the backend enforces them on the AI's picks.
+const LENGTH_PRESETS = [
+  { id: 'short', label: '15–30 dtk', min: 15, max: 30 },
+  { id: 'medium', label: '30–60 dtk', min: 30, max: 60 },
+  { id: 'long', label: '60–90 dtk', min: 60, max: 90 },
+];
 
 export default function App() {
   const [videoFile, setVideoFile] = useState(null);
@@ -39,6 +37,9 @@ export default function App() {
   const [aiProviders, setAiProviders] = useState(null);
   const [aiProvider, setAiProvider] = useState(() => readPref('clipper.aiProvider', ''));
   const [ollamaModel, setOllamaModel] = useState(() => readPref('clipper.ollamaModel', ''));
+  const [clipCount, setClipCount] = useState(() => Number(readPref('clipper.clipCount', '5')) || 5);
+  const [clipLength, setClipLength] = useState(() => readPref('clipper.clipLength', 'medium'));
+  const [analysisInfo, setAnalysisInfo] = useState(null);
 
   const videoRef = useRef(null);
 
@@ -61,6 +62,8 @@ export default function App() {
 
   useEffect(() => { writePref('clipper.aiProvider', aiProvider); }, [aiProvider]);
   useEffect(() => { writePref('clipper.ollamaModel', ollamaModel); }, [ollamaModel]);
+  useEffect(() => { writePref('clipper.clipCount', String(clipCount)); }, [clipCount]);
+  useEffect(() => { writePref('clipper.clipLength', clipLength); }, [clipLength]);
 
   const aiLabel = aiProvider === 'ollama' ? `Ollama · ${ollamaModel || 'lokal'}` : 'OpenRouter';
 
@@ -149,78 +152,21 @@ export default function App() {
 
     setStatus('processing');
     setExportedClips([]);
+    setAnalysisInfo(null);
 
     try {
-      // Step A: AI Analysis
-      setProgress({ step: `Analisis AI (${aiLabel})`, detail: 'Mendeteksi segmen viral (3-10 clip)...', percent: 5 });
-      const duration = videoDuration || 60;
-
-      const prompt = `Anda adalah ahli editor video viral profesional.
-Video berdurasi ${Math.round(duration)} detik. Temukan 3 sampai 10 segmen terbaik untuk clip viral vertikal (Reels/TikTok/Shorts).
-ATURAN:
-- Minimal 3 segmen, Maksimal 10 segmen. Jumlah tergantung panjang video dan kualitas konten.
-- start dan end dalam detik (angka bulat), rentang 0-${Math.round(duration)}
-- Durasi tiap segmen 15-60 detik, TIDAK overlap
-- Setiap segmen WAJIB punya "viral_score" (1-100) yang menunjukkan seberapa viral segmen tersebut
-- Setiap segmen WAJIB punya array 'captions' (4-6 caption per segmen, maks 8 kata per caption)
-- Caption: text, start_offset, end_offset (relatif dari start segmen, detik)
-- Caption harus menutupi seluruh durasi segmen tanpa gap
-- Urutkan dari viral_score tertinggi ke terendah
-Format JSON MURNI:
-{"moments":[{"id":1,"start":0,"end":20,"title":"Hook Awal","viral_score":85,"captions":[{"text":"INI DIA RAHASIANYA","start_offset":0,"end_offset":4},{"text":"WAJIB NONTON SAMPAI HABIS","start_offset":4,"end_offset":8}]}]}`;
-
-      // The backend holds the OpenRouter key; the browser never sees it.
-      const response = await fetch('/api/analyze', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          systemPrompt: prompt,
-          userPrompt: `Analisis video "${videoFile.name}" (durasi: ${Math.round(duration)}s). Temukan 3-10 segmen paling viral dengan skor viralnya.`,
-          provider: aiProvider || undefined,
-          model: aiProvider === 'ollama' ? ollamaModel || undefined : undefined,
-        }),
-      });
-
-      const result = await response.json().catch(() => ({}));
-      if (!response.ok || !result.ok) throw new Error(result.error || `API Error: ${response.status}`);
-      const content = parseAiJson(result.content);
-      if (!Array.isArray(content.moments) || content.moments.length === 0) {
-        throw new Error(`AI (${aiLabel}) tidak mengembalikan segmen. Coba lagi atau ganti model.`);
-      }
-
-      // Normalize moments & distribute captions evenly
-      let moments = content.moments.map((m, idx) => {
-        const start = Math.max(0, Math.min(parseFloat(m.start), duration));
-        const end = Math.max(start + 5, Math.min(parseFloat(m.end), duration));
-        const dur = end - start;
-        const viralScore = Math.max(1, Math.min(100, Math.round(Number(m.viral_score) || 50)));
-        const rawCaptions = m.captions || [];
-        const captions = rawCaptions.length > 0
-          ? rawCaptions.map((c, i) => {
-              const segLen = dur / rawCaptions.length;
-              return {
-                text: c.text || 'VIRAL MOMENT',
-                start_offset: parseFloat((i * segLen).toFixed(2)),
-                end_offset: parseFloat(((i + 1) * segLen - 0.05).toFixed(2))
-              };
-            })
-          : [{ text: m.title || 'VIRAL', start_offset: 0, end_offset: dur }];
-        return { id: idx + 1, start, end, duration: dur, captions, title: m.title || `Clip ${idx + 1}`, viralScore };
-      });
-      // Enforce 3-10 clip range
-      moments = moments.slice(0, 10);
-      if (moments.length < 3) {
-        throw new Error(`AI hanya menemukan ${moments.length} segmen. Minimal 3 diperlukan. Coba video yang lebih panjang.`);
-      }
-
-      setProgress({ step: 'Analisis AI', detail: `${moments.length} segmen ditemukan!`, percent: 15 });
-
-      // Step B: Send job to local backend (plain clips, no subtitles)
-      setProgress({ step: 'Ekspor lokal', detail: 'Memotong clip tanpa subtitle...', percent: 20 });
+      // The backend transcribes the video, asks the AI and cuts the clips in one job.
+      // API keys stay on the server; the browser only sends the video and settings.
+      const preset = LENGTH_PRESETS.find(p => p.id === clipLength) || LENGTH_PRESETS[1];
+      setProgress({ step: 'Upload video', detail: `Mengirim ke server lokal (${aiLabel})...`, percent: 1 });
       const formData = new FormData();
       formData.append('video', videoFile);
       formData.append('face_detection', faceDetection ? '1' : '0');
-      formData.append('moments', JSON.stringify(moments));
+      formData.append('provider', aiProvider || '');
+      if (aiProvider === 'ollama' && ollamaModel) formData.append('model', ollamaModel);
+      formData.append('clip_count', String(clipCount));
+      formData.append('min_duration', String(preset.min));
+      formData.append('max_duration', String(preset.max));
 
       const processResponse = await fetch('/api/process', {
         method: 'POST',
@@ -246,7 +192,7 @@ Format JSON MURNI:
         evtSource.addEventListener('done', (e) => {
           evtSource.close();
           const result = JSON.parse(e.data);
-          if (result.ok) resolve(result.clips);
+          if (result.ok) { setAnalysisInfo(result.analysis || null); resolve(result.clips); }
           else reject(new Error(result.error || 'Processing gagal.'));
         });
 
@@ -257,9 +203,8 @@ Format JSON MURNI:
       });
 
       setProgress({ step: 'Pemotongan selesai', detail: `${clips.length} clip siap di-preview`, percent: 100 });
-      setExportedClips(clips.map((c, i) => ({
+      setExportedClips(clips.map(c => ({
         ...c,
-        viralScore: moments[i]?.viralScore ?? null,
         subtitleStatus: 'idle', subtitledUrl: null, subtitledFilename: null, subProgress: 0,
         clipSubSize: subtitleSize, clipSubY: subtitleY,
       })));
@@ -505,6 +450,39 @@ Format JSON MURNI:
                   <h2 className="text-sm font-black uppercase tracking-widest">Proses</h2>
                 </div>
 
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-5">
+                  <div>
+                    <label htmlFor="clip-count" className="block text-[10px] font-black uppercase tracking-widest text-slate-500 mb-1">Jumlah clip</label>
+                    <select
+                      id="clip-count"
+                      value={clipCount}
+                      onChange={e => setClipCount(Number(e.target.value))}
+                      disabled={status === 'processing'}
+                      className="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-sm font-bold text-slate-200 focus:outline-none focus:border-indigo-500"
+                    >
+                      {Array.from({ length: 10 }, (_, i) => i + 1).map(n => <option key={n} value={n}>{n} clip</option>)}
+                    </select>
+                  </div>
+                  <div>
+                    <p className="text-[10px] font-black uppercase tracking-widest text-slate-500 mb-1">Durasi per clip</p>
+                    <div role="radiogroup" aria-label="Durasi per clip" className="grid grid-cols-3 gap-1 p-1 bg-slate-900/60 border border-slate-800 rounded-lg">
+                      {LENGTH_PRESETS.map(p => (
+                        <button
+                          key={p.id}
+                          type="button"
+                          role="radio"
+                          aria-checked={clipLength === p.id}
+                          disabled={status === 'processing'}
+                          onClick={() => setClipLength(p.id)}
+                          className={`py-1.5 rounded-md text-[11px] font-black transition-colors disabled:opacity-40 ${clipLength === p.id ? 'bg-indigo-600 text-white' : 'text-slate-300 hover:bg-slate-800'}`}
+                        >
+                          {p.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+
                 <div className="flex items-center gap-3 mb-4">
                   <input id="face-detect-toggle" type="checkbox" checked={faceDetection} onChange={e => setFaceDetection(e.target.checked)} className="w-4 h-4 accent-indigo-500" />
                   <label htmlFor="face-detect-toggle" className="text-sm font-black text-slate-300">Auto Face Detection</label>
@@ -547,7 +525,19 @@ Format JSON MURNI:
                   <CheckCircle2 size={20} className="text-green-400" />
                   <h2 className="text-sm font-black uppercase tracking-widest text-green-400">{exportedClips.length} Clip Siap!</h2>
                 </div>
-                <p className="text-xs text-slate-500 mb-6">Preview clip tanpa subtitle. Klik "Generate Subtitle" untuk menambahkan teks, lalu unduh.</p>
+                <p className="text-xs text-slate-500 mb-3">Preview clip tanpa subtitle. Klik "Generate Subtitle" untuk menambahkan teks, lalu unduh.</p>
+                {analysisInfo && (
+                  analysisInfo.source === 'transcript' ? (
+                    <p className="text-[11px] text-slate-500 mb-6">
+                      Dipilih AI dari transkrip {analysisInfo.words.toLocaleString('id-ID')} kata
+                      {analysisInfo.stats ? ` (${analysisInfo.stats.received} kandidat diperiksa)` : ''}.
+                    </p>
+                  ) : (
+                    <p className="text-[11px] text-amber-300 bg-amber-500/10 border border-amber-500/20 rounded-xl px-4 py-3 mb-6">
+                      {analysisInfo.notice || 'AI hanya melihat durasi video, bukan isinya.'}
+                    </p>
+                  )
+                )}
 
                 <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
                   {exportedClips.map((clip, idx) => (
@@ -578,7 +568,11 @@ Format JSON MURNI:
                               </span>
                             )}
                           </div>
-                          <p className="text-[9px] text-slate-600 mt-0.5">{clip.filename}</p>
+                          {clip.start != null && (
+                            <p className="text-[10px] font-mono text-slate-500 mt-0.5">{fmt(clip.start)}–{fmt(clip.end)} · {Math.round(clip.duration)} dtk</p>
+                          )}
+                          {clip.reason && <p className="text-[11px] text-slate-400 mt-1.5 leading-snug">{clip.reason}</p>}
+                          <p className="text-[9px] text-slate-600 mt-1 truncate">{clip.filename}</p>
                         </div>
 
                         {clip.subtitleStatus === 'idle' && (
