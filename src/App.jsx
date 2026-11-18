@@ -4,6 +4,8 @@ import {
   CheckCircle2, Loader2, Cpu, ShieldCheck, Trash2,
   Volume2, VolumeX, Type, MoveVertical, Save, TrendingUp
 } from 'lucide-react';
+import HighlightReview from './components/HighlightReview';
+import Library from './components/Library';
 
 const readPref = (key, fallback) => {
   try { return localStorage.getItem(key) || fallback; } catch { return fallback; }
@@ -39,9 +41,14 @@ export default function App() {
   const [ollamaModel, setOllamaModel] = useState(() => readPref('clipper.ollamaModel', ''));
   const [clipCount, setClipCount] = useState(() => Number(readPref('clipper.clipCount', '5')) || 5);
   const [clipLength, setClipLength] = useState(() => readPref('clipper.clipLength', 'medium'));
-  const [analysisInfo, setAnalysisInfo] = useState(null);
+  const [direction, setDirection] = useState('');
+  const [hookEnabled, setHookEnabled] = useState(() => readPref('clipper.hook', '1') === '1');
+  const [session, setSession] = useState(null);
+  const [drafts, setDrafts] = useState([]);
+  const [sessions, setSessions] = useState([]);
 
   const videoRef = useRef(null);
+  const previewEndRef = useRef(null);
 
   // AI providers (OpenRouter / Ollama) available on the backend
   useEffect(() => {
@@ -64,6 +71,7 @@ export default function App() {
   useEffect(() => { writePref('clipper.ollamaModel', ollamaModel); }, [ollamaModel]);
   useEffect(() => { writePref('clipper.clipCount', String(clipCount)); }, [clipCount]);
   useEffect(() => { writePref('clipper.clipLength', clipLength); }, [clipLength]);
+  useEffect(() => { writePref('clipper.hook', hookEnabled ? '1' : '0'); }, [hookEnabled]);
 
   const aiLabel = aiProvider === 'ollama' ? `Ollama · ${ollamaModel || 'lokal'}` : 'OpenRouter';
 
@@ -99,7 +107,14 @@ export default function App() {
   useEffect(() => {
     const v = videoRef.current;
     if (!v) return;
-    const sync = () => setCurrentTime(v.currentTime);
+    const sync = () => {
+      setCurrentTime(v.currentTime);
+      // Highlight preview: stop at the end of the span being previewed.
+      if (previewEndRef.current !== null && v.currentTime >= previewEndRef.current) {
+        previewEndRef.current = null;
+        v.pause();
+      }
+    };
     const onPlay = () => setIsPlaying(true);
     const onPause = () => setIsPlaying(false);
     const onMeta = () => setVideoDuration(v.duration || 0);
@@ -136,12 +151,76 @@ export default function App() {
     return `${mm}:${ss}`;
   };
 
-  const escapeFFmpegText = (text) =>
-    text.replace(/[\\'"]/g, '').replace(/:/g, ' ').replace(/;/g, ' ').replace(/[\[\]]/g, '');
+  // Follow a backend job over SSE until it finishes; resolves with its result.
+  const followJob = (jobId, onProgress) => new Promise((resolve, reject) => {
+    const evtSource = new EventSource(`/api/progress/${jobId}`);
+    evtSource.addEventListener('progress', (e) => onProgress?.(JSON.parse(e.data)));
+    evtSource.addEventListener('done', (e) => {
+      evtSource.close();
+      const result = JSON.parse(e.data);
+      if (result.ok) resolve(result);
+      else reject(new Error(result.error || 'Processing gagal.'));
+    });
+    evtSource.onerror = () => {
+      evtSource.close();
+      reject(new Error('Koneksi ke server terputus.'));
+    };
+  });
 
-  // 3. MAIN: Detect viral segments + export 5 clips with subtitles
-  const processViralClips = async () => {
-    if (!videoFile) {
+  const postJson = async (url, body) => {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok || !payload.ok) throw new Error(payload.error || `Request gagal (${response.status}).`);
+    return payload;
+  };
+
+  const refreshLibrary = () => {
+    fetch('/api/sessions')
+      .then(r => (r.ok ? r.json() : null))
+      .then(data => { if (data?.ok) setSessions(data.sessions); })
+      .catch(() => {});
+  };
+  useEffect(refreshLibrary, []);
+
+  const toUiClip = (clip) => ({
+    ...clip,
+    subtitleStatus: clip.subtitledUrl ? 'done' : 'idle',
+    subProgress: clip.subtitledUrl ? 100 : 0,
+    clipSubSize: subtitleSize,
+    clipSubY: subtitleY,
+  });
+
+  // Load a session's candidates and clips into the UI.
+  const applySession = (next) => {
+    setSession(next);
+    setDrafts(next.candidates.map(c => ({
+      id: c.id, selected: c.selected, start: c.start, end: c.end,
+      title: c.title, hookText: c.hookText || '', reason: c.reason,
+      viralScore: c.viralScore, requested: c.requested,
+    })));
+    setExportedClips([...next.clips].reverse().map(toUiClip));
+    if (next.settings?.direction !== undefined) setDirection(next.settings.direction);
+  };
+
+  const analysisSettings = () => {
+    const preset = LENGTH_PRESETS.find(p => p.id === clipLength) || LENGTH_PRESETS[1];
+    return {
+      provider: aiProvider || '',
+      model: aiProvider === 'ollama' ? ollamaModel || '' : '',
+      clip_count: String(clipCount),
+      min_duration: String(preset.min),
+      max_duration: String(preset.max),
+      direction: direction.trim(),
+    };
+  };
+
+  // 3. Analysis: upload a new video, or re-run the AI on the open session's transcript.
+  const startAnalysis = async () => {
+    if (!videoFile && !session) {
       alert('Harap pilih video terlebih dahulu.');
       return;
     }
@@ -150,70 +229,104 @@ export default function App() {
       return;
     }
 
-    setStatus('processing');
-    setExportedClips([]);
-    setAnalysisInfo(null);
-
+    const previousStatus = status;
+    setStatus('analyzing');
+    const settings = analysisSettings();
     try {
-      // The backend transcribes the video, asks the AI and cuts the clips in one job.
-      // API keys stay on the server; the browser only sends the video and settings.
-      const preset = LENGTH_PRESETS.find(p => p.id === clipLength) || LENGTH_PRESETS[1];
-      setProgress({ step: 'Upload video', detail: `Mengirim ke server lokal (${aiLabel})...`, percent: 1 });
-      const formData = new FormData();
-      formData.append('video', videoFile);
-      formData.append('face_detection', faceDetection ? '1' : '0');
-      formData.append('provider', aiProvider || '');
-      if (aiProvider === 'ollama' && ollamaModel) formData.append('model', ollamaModel);
-      formData.append('clip_count', String(clipCount));
-      formData.append('min_duration', String(preset.min));
-      formData.append('max_duration', String(preset.max));
-
-      const processResponse = await fetch('/api/process', {
-        method: 'POST',
-        body: formData,
-      });
-
-      const processPayload = await processResponse.json();
-      if (!processResponse.ok || !processPayload.ok) {
-        throw new Error(processPayload.error || 'Backend processing gagal.');
+      let jobId;
+      if (session) {
+        setProgress({ step: `Analisis ulang (${aiLabel})`, detail: 'Memakai transkrip yang sudah ada...', percent: 5 });
+        ({ jobId } = await postJson(`/api/sessions/${session.id}/analyze`, settings));
+      } else {
+        setProgress({ step: 'Upload video', detail: `Mengirim ke server lokal (${aiLabel})...`, percent: 1 });
+        const formData = new FormData();
+        formData.append('video', videoFile);
+        Object.entries(settings).forEach(([key, value]) => formData.append(key, value));
+        const response = await fetch('/api/sessions', { method: 'POST', body: formData });
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok || !payload.ok) throw new Error(payload.error || 'Upload gagal.');
+        jobId = payload.jobId;
       }
 
-      const { jobId } = processPayload;
-
-      // Real-time progress via SSE
-      const clips = await new Promise((resolve, reject) => {
-        const evtSource = new EventSource(`/api/progress/${jobId}`);
-
-        evtSource.addEventListener('progress', (e) => {
-          const data = JSON.parse(e.data);
-          setProgress({ step: data.step, detail: data.detail, percent: data.percent });
-        });
-
-        evtSource.addEventListener('done', (e) => {
-          evtSource.close();
-          const result = JSON.parse(e.data);
-          if (result.ok) { setAnalysisInfo(result.analysis || null); resolve(result.clips); }
-          else reject(new Error(result.error || 'Processing gagal.'));
-        });
-
-        evtSource.onerror = () => {
-          evtSource.close();
-          reject(new Error('Koneksi ke server terputus.'));
-        };
-      });
-
-      setProgress({ step: 'Pemotongan selesai', detail: `${clips.length} clip siap di-preview`, percent: 100 });
-      setExportedClips(clips.map(c => ({
-        ...c,
-        subtitleStatus: 'idle', subtitledUrl: null, subtitledFilename: null, subProgress: 0,
-        clipSubSize: subtitleSize, clipSubY: subtitleY,
-      })));
-      setStatus('completed');
-
+      const result = await followJob(jobId, data => setProgress({ step: data.step, detail: data.detail, percent: data.percent }));
+      applySession(result.session);
+      setStatus('review');
+      refreshLibrary();
     } catch (err) {
-      console.error('Process Error:', err);
-      setStatus('idle');
-      alert('Gagal memproses: ' + err.message);
+      console.error('Analysis Error:', err);
+      setStatus(previousStatus === 'analyzing' ? 'idle' : previousStatus);
+      alert('Gagal menganalisis: ' + err.message);
+    }
+  };
+
+  // 4. Render the highlights the user picked, with their edits.
+  const renderSelected = async () => {
+    if (!session) return;
+    const items = drafts.filter(d => d.selected).map(d => ({
+      id: d.id, start: d.start, end: d.end, title: d.title, hookText: d.hookText,
+    }));
+    setStatus('rendering');
+    setProgress({ step: 'Render clip', detail: `Menyiapkan ${items.length} clip...`, percent: 0 });
+    try {
+      const { jobId } = await postJson(`/api/sessions/${session.id}/render`, { items, faceDetection, hook: hookEnabled });
+      const result = await followJob(jobId, data => setProgress({ step: data.step, detail: data.detail, percent: data.percent }));
+      applySession(result.session);
+      setStatus('completed');
+      refreshLibrary();
+    } catch (err) {
+      console.error('Render Error:', err);
+      setStatus('review');
+      alert('Gagal merender: ' + err.message);
+    }
+  };
+
+  // Seek the source preview to a highlight and stop at its end.
+  const previewSpan = (start, end) => {
+    const v = videoRef.current;
+    if (!v) return;
+    previewEndRef.current = end;
+    v.currentTime = start;
+    v.play().catch(() => {});
+    v.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  };
+
+  const resetAll = () => {
+    if (videoSrc?.startsWith('blob:')) URL.revokeObjectURL(videoSrc);
+    setVideoFile(null);
+    setVideoSrc(null);
+    setSession(null);
+    setDrafts([]);
+    setExportedClips([]);
+    setDirection('');
+    setStatus('idle');
+  };
+
+  const openSession = async (id) => {
+    try {
+      const response = await fetch(`/api/sessions/${id}`);
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok || !payload.ok) throw new Error(payload.error || 'Session tidak bisa dibuka.');
+      if (videoSrc?.startsWith('blob:')) URL.revokeObjectURL(videoSrc);
+      setVideoFile(null);
+      setVideoSrc(payload.session.videoUrl);
+      applySession(payload.session);
+      setStatus(payload.session.clips.length ? 'completed' : payload.session.candidates.length ? 'review' : 'idle');
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    } catch (err) {
+      alert(err.message);
+    }
+  };
+
+  const deleteSessionItem = async (item) => {
+    if (!window.confirm(`Hapus "${item.name}" beserta ${item.clips} clip-nya? Ini tidak bisa dibatalkan.`)) return;
+    try {
+      const response = await fetch(`/api/sessions/${item.id}`, { method: 'DELETE' });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok || !payload.ok) throw new Error(payload.error || 'Gagal menghapus.');
+      if (session?.id === item.id) resetAll();
+      refreshLibrary();
+    } catch (err) {
+      alert(err.message);
     }
   };
 
@@ -225,49 +338,30 @@ export default function App() {
     setExportedClips(prev => prev.map((c, i) => i === clipIndex ? { ...c, subtitleStatus: 'processing', subProgress: 0 } : c));
 
     try {
-      const resp = await fetch('/api/add-subtitle', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          clipFilename: clip.filename,
-          captions: clip.captions,
-          subtitleSize: clip.clipSubSize ?? subtitleSize,
-          subtitleY: clip.clipSubY ?? subtitleY,
-          clipDuration: clip.duration,
-        }),
+      const { jobId } = await postJson('/api/add-subtitle', {
+        clipFilename: clip.filename,
+        captions: clip.captions,
+        subtitleSize: clip.clipSubSize ?? subtitleSize,
+        subtitleY: clip.clipSubY ?? subtitleY,
+        clipDuration: clip.duration,
+        sessionId: session?.id,
       });
-      const payload = await resp.json();
-      if (!resp.ok || !payload.ok) throw new Error(payload.error || 'Gagal');
-
-      const { jobId } = payload;
-
-      await new Promise((resolve, reject) => {
-        const evtSource = new EventSource(`/api/progress/${jobId}`);
-        evtSource.addEventListener('progress', (e) => {
-          const data = JSON.parse(e.data);
-          setExportedClips(prev => prev.map((c, i) => i === clipIndex ? { ...c, subProgress: data.percent } : c));
-        });
-        evtSource.addEventListener('done', (e) => {
-          evtSource.close();
-          const result = JSON.parse(e.data);
-          if (result.ok) {
-            setExportedClips(prev => prev.map((c, i) => i === clipIndex ? {
-              ...c, subtitleStatus: 'done', subProgress: 100,
-              subtitledUrl: result.url, subtitledFilename: result.filename,
-            } : c));
-            resolve();
-          } else {
-            reject(new Error(result.error));
-          }
-        });
-        evtSource.onerror = () => { evtSource.close(); reject(new Error('Koneksi terputus')); };
+      const result = await followJob(jobId, data => {
+        setExportedClips(prev => prev.map((c, i) => i === clipIndex ? { ...c, subProgress: data.percent } : c));
       });
+      setExportedClips(prev => prev.map((c, i) => i === clipIndex ? {
+        ...c, subtitleStatus: 'done', subProgress: 100,
+        subtitledUrl: result.url, subtitledFilename: result.filename,
+      } : c));
     } catch (err) {
       console.error('Subtitle Error:', err);
       setExportedClips(prev => prev.map((c, i) => i === clipIndex ? { ...c, subtitleStatus: 'idle', subProgress: 0, subtitledUrl: null, subtitledFilename: null } : c));
-      alert(`Gagal generate subtitle clip ${clip.id}: ${err.message}`);
+      alert(`Gagal generate subtitle clip ${clipIndex + 1}: ${err.message}`);
     }
   };
+
+  const busy = status === 'analyzing' || status === 'rendering';
+  const sourceName = videoFile?.name || session?.name || '';
 
   return (
     <div className="min-h-screen bg-[#050505] text-slate-100 font-sans selection:bg-indigo-500/30">
@@ -326,7 +420,7 @@ export default function App() {
                       type="button"
                       role="radio"
                       aria-checked={active}
-                      disabled={!available || status === 'processing'}
+                      disabled={!available || busy}
                       onClick={() => setAiProvider(opt.id)}
                       title={available ? undefined : opt.off}
                       className={`py-2.5 px-3 rounded-lg text-left transition-colors disabled:opacity-40 disabled:cursor-not-allowed ${active ? 'bg-indigo-600 text-white' : 'text-slate-300 hover:bg-slate-800'}`}
@@ -346,7 +440,7 @@ export default function App() {
                     id="ollama-model"
                     value={ollamaModel}
                     onChange={e => setOllamaModel(e.target.value)}
-                    disabled={status === 'processing'}
+                    disabled={busy}
                     className="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-sm font-bold text-slate-200 focus:outline-none focus:border-indigo-500"
                   >
                     {aiProviders.ollama.models.map(m => <option key={m} value={m}>{m}</option>)}
@@ -363,16 +457,14 @@ export default function App() {
                 <h2 className="text-sm font-black uppercase tracking-widest">Pilih Video</h2>
               </div>
 
-              {!videoFile ? (
+              {!videoSrc ? (
                 <div className="border-2 border-dashed border-slate-800 rounded-2xl p-10 text-center relative group hover:border-indigo-500/50 transition-all cursor-pointer">
                   <input type="file" accept="video/*" className="absolute inset-0 opacity-0 cursor-pointer z-10" onChange={(e) => {
                     const file = e.target.files[0];
                     if (file) {
-                      if (videoSrc) URL.revokeObjectURL(videoSrc);
+                      resetAll();
                       setVideoFile(file);
                       setVideoSrc(URL.createObjectURL(file));
-                      setExportedClips([]);
-                      setStatus('idle');
                     }
                   }} />
                   <UploadCloud className="mx-auto mb-3 text-slate-700 group-hover:text-indigo-400 transition-colors" size={48} />
@@ -384,14 +476,13 @@ export default function App() {
                   <div className="flex items-center gap-3 overflow-hidden">
                     <FileVideo className="text-indigo-400 shrink-0" size={22} />
                     <div className="overflow-hidden">
-                      <p className="text-xs font-bold truncate text-slate-200">{videoFile.name}</p>
-                      <p className="text-[9px] text-slate-600 mt-0.5">{(videoFile.size / (1024 * 1024)).toFixed(1)} MB {videoDuration > 0 && `• ${fmt(videoDuration)}`}</p>
+                      <p className="text-xs font-bold truncate text-slate-200">{sourceName}</p>
+                      <p className="text-[9px] text-slate-600 mt-0.5">
+                        {videoFile ? `${(videoFile.size / (1024 * 1024)).toFixed(1)} MB` : 'Dari riwayat'} {videoDuration > 0 && `• ${fmt(videoDuration)}`}
+                      </p>
                     </div>
                   </div>
-                  <button onClick={() => {
-                    if (videoSrc) URL.revokeObjectURL(videoSrc);
-                    setVideoFile(null); setVideoSrc(null); setExportedClips([]); setStatus('idle');
-                  }} className="text-slate-600 hover:text-red-500 p-2"><Trash2 size={18} /></button>
+                  <button onClick={resetAll} disabled={busy} aria-label="Tutup video" className="text-slate-600 hover:text-red-500 p-2 disabled:opacity-40"><Trash2 size={18} /></button>
                 </div>
               )}
             </div>
@@ -442,8 +533,8 @@ export default function App() {
               </div>
             )}
 
-            {/* STEP 3: Process Button */}
-            {videoSrc && status !== 'completed' && (
+            {/* STEP 3: Analysis settings (before the first analysis of a video) */}
+            {videoSrc && (status === 'idle' || status === 'analyzing') && (
               <div className="bg-[#0A0A0A] border border-slate-800/60 rounded-3xl p-8">
                 <div className="flex items-center gap-3 mb-6">
                   <span className="bg-indigo-600 text-white text-[10px] font-black w-6 h-6 flex items-center justify-center rounded-full">3</span>
@@ -457,7 +548,7 @@ export default function App() {
                       id="clip-count"
                       value={clipCount}
                       onChange={e => setClipCount(Number(e.target.value))}
-                      disabled={status === 'processing'}
+                      disabled={busy}
                       className="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-sm font-bold text-slate-200 focus:outline-none focus:border-indigo-500"
                     >
                       {Array.from({ length: 10 }, (_, i) => i + 1).map(n => <option key={n} value={n}>{n} clip</option>)}
@@ -472,7 +563,7 @@ export default function App() {
                           type="button"
                           role="radio"
                           aria-checked={clipLength === p.id}
-                          disabled={status === 'processing'}
+                          disabled={busy}
                           onClick={() => setClipLength(p.id)}
                           className={`py-1.5 rounded-md text-[11px] font-black transition-colors disabled:opacity-40 ${clipLength === p.id ? 'bg-indigo-600 text-white' : 'text-slate-300 hover:bg-slate-800'}`}
                         >
@@ -483,25 +574,38 @@ export default function App() {
                   </div>
                 </div>
 
-                <div className="flex items-center gap-3 mb-4">
-                  <input id="face-detect-toggle" type="checkbox" checked={faceDetection} onChange={e => setFaceDetection(e.target.checked)} className="w-4 h-4 accent-indigo-500" />
-                  <label htmlFor="face-detect-toggle" className="text-sm font-black text-slate-300">Auto Face Detection</label>
+                <div className="mb-5">
+                  <label htmlFor="ai-direction" className="block text-[10px] font-black uppercase tracking-widest text-slate-500 mb-1">
+                    Arahan untuk AI <span className="normal-case tracking-normal font-bold text-slate-600">(opsional)</span>
+                  </label>
+                  <textarea
+                    id="ai-direction"
+                    value={direction}
+                    onChange={e => setDirection(e.target.value)}
+                    maxLength={1000}
+                    rows={2}
+                    disabled={busy}
+                    placeholder='Contoh: "fokus ke bagian soal bisnis", "skip intro", atau "ambil 2:00 - 2:50"'
+                    className="w-full bg-slate-900 border border-slate-800 rounded-xl px-3 py-2.5 text-sm text-slate-200 focus:outline-none focus:border-indigo-500 resize-y"
+                  />
+                  <p className="mt-1 text-[10px] text-slate-600">Rentang waktu yang ditulis (m:ss - m:ss) diambil persis apa adanya.</p>
                 </div>
 
                 <button
-                  onClick={processViralClips}
-                  disabled={status === 'processing'}
-                  className="w-full bg-gradient-to-r from-indigo-600 to-purple-600 hover:from-indigo-500 hover:to-purple-500 text-white font-black py-5 rounded-2xl text-sm uppercase tracking-wider shadow-xl active:scale-[0.98] transition-all flex items-center justify-center gap-3 disabled:opacity-30 disabled:cursor-not-allowed"
+                  onClick={startAnalysis}
+                  disabled={busy}
+                  className="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-black py-5 rounded-2xl text-sm uppercase tracking-wider shadow-xl active:scale-[0.98] transition-all flex items-center justify-center gap-3 disabled:opacity-30 disabled:cursor-not-allowed"
                 >
-                  {status === 'processing' ? (
-                    <><Loader2 className="animate-spin" size={20} /> MEMPROSES...</>
+                  {busy ? (
+                    <><Loader2 className="animate-spin" size={20} /> MENGANALISIS...</>
                   ) : (
-                    <><Sparkles size={20} /> JADIKAN CLIP VIRAL</>
+                    <><Sparkles size={20} /> CARI HIGHLIGHT VIRAL</>
                   )}
                 </button>
+                <p className="mt-2 text-[10px] text-slate-600 text-center">Belum ada yang dirender. Kamu pilih dan edit highlight-nya dulu di langkah berikutnya.</p>
 
                 {/* Progress */}
-                {status === 'processing' && (
+                {status === 'analyzing' && (
                   <div className="mt-6 p-5 bg-black/60 border border-slate-800 rounded-2xl space-y-3">
                     <div className="flex justify-between items-center">
                       <div>
@@ -518,6 +622,28 @@ export default function App() {
               </div>
             )}
 
+            {/* STEP 3b: Review and edit the AI's highlights before rendering */}
+            {videoSrc && session && (status === 'review' || status === 'rendering' || (status === 'analyzing' && drafts.length > 0)) && (
+              <HighlightReview
+                drafts={drafts}
+                setDrafts={setDrafts}
+                duration={session.duration}
+                analysis={session.analysis}
+                fmt={fmt}
+                busy={busy}
+                progress={progress}
+                onPreview={previewSpan}
+                onRender={renderSelected}
+                onReanalyze={startAnalysis}
+                hookEnabled={hookEnabled}
+                setHookEnabled={setHookEnabled}
+                faceDetection={faceDetection}
+                setFaceDetection={setFaceDetection}
+                direction={direction}
+                setDirection={setDirection}
+              />
+            )}
+
             {/* STEP 4: Results - Individual Clip Boxes */}
             {status === 'completed' && exportedClips.length > 0 && (
               <div className="bg-[#0A0A0A] border border-green-800/40 rounded-3xl p-8">
@@ -525,20 +651,7 @@ export default function App() {
                   <CheckCircle2 size={20} className="text-green-400" />
                   <h2 className="text-sm font-black uppercase tracking-widest text-green-400">{exportedClips.length} Clip Siap!</h2>
                 </div>
-                <p className="text-xs text-slate-500 mb-3">Preview clip tanpa subtitle. Klik "Generate Subtitle" untuk menambahkan teks, lalu unduh.</p>
-                {analysisInfo && (
-                  analysisInfo.source === 'transcript' ? (
-                    <p className="text-[11px] text-slate-500 mb-6">
-                      Dipilih AI dari transkrip {analysisInfo.words.toLocaleString('id-ID')} kata
-                      {analysisInfo.stats ? ` (${analysisInfo.stats.received} kandidat diperiksa)` : ''}.
-                    </p>
-                  ) : (
-                    <p className="text-[11px] text-amber-300 bg-amber-500/10 border border-amber-500/20 rounded-xl px-4 py-3 mb-6">
-                      {analysisInfo.notice || 'AI hanya melihat durasi video, bukan isinya.'}
-                    </p>
-                  )
-                )}
-
+                <p className="text-xs text-slate-500 mb-6">Preview clip tanpa subtitle. Klik "Generate Subtitle" untuk menambahkan teks, lalu unduh.</p>
                 <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
                   {exportedClips.map((clip, idx) => (
                     <div key={clip.id} className="bg-black/60 border border-slate-800 rounded-2xl overflow-hidden flex flex-col">
@@ -557,7 +670,7 @@ export default function App() {
                       <div className="p-4 flex flex-col gap-3">
                         <div>
                           <div className="flex items-center justify-between">
-                            <p className="text-xs font-black text-slate-200 truncate flex-1">Clip {clip.id}: {clip.title}</p>
+                            <p className="text-xs font-black text-slate-200 truncate flex-1">Clip {exportedClips.length - idx}: {clip.title}</p>
                             {clip.viralScore != null && (
                               <span className={`shrink-0 ml-2 flex items-center gap-1 text-[10px] font-black px-2 py-0.5 rounded-full ${
                                 clip.viralScore >= 80 ? 'bg-green-500/20 text-green-400' :
@@ -627,14 +740,32 @@ export default function App() {
                   ))}
                 </div>
 
-                <button
-                  onClick={() => { setExportedClips([]); setStatus('idle'); }}
-                  className="mt-6 w-full py-3 rounded-xl text-[10px] font-black uppercase tracking-widest bg-slate-900 border border-slate-800 hover:border-slate-600 transition-colors text-slate-400"
-                >
-                  BUAT CLIP BARU
-                </button>
+                <div className="mt-6 grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <button
+                    onClick={() => setStatus('review')}
+                    disabled={!drafts.length}
+                    className="w-full py-3 rounded-xl text-[10px] font-black uppercase tracking-widest bg-slate-900 border border-slate-800 hover:border-slate-600 transition-colors text-slate-300 disabled:opacity-40"
+                  >
+                    Kembali ke daftar highlight
+                  </button>
+                  <button
+                    onClick={resetAll}
+                    className="w-full py-3 rounded-xl text-[10px] font-black uppercase tracking-widest bg-slate-900 border border-slate-800 hover:border-slate-600 transition-colors text-slate-400"
+                  >
+                    Video baru
+                  </button>
+                </div>
               </div>
             )}
+
+            <Library
+              sessions={sessions}
+              activeId={session?.id}
+              busy={busy}
+              fmt={fmt}
+              onOpen={openSession}
+              onDelete={deleteSessionItem}
+            />
           </div>
         )}
       </div>

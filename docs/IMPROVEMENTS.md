@@ -60,7 +60,9 @@ Yang **sudah lebih baik** di Open Clipper Pro dan perlu dipertahankan:
 6. **Caption karaoke.** Sorot kata yang sedang diucapkan (`\c&H00FFFF&` atau tag `\k`), pakai huruf kapital, font tebal, dan outline. Hitung `PlayRes` dari resolusi asli video. Sediakan pilihan preset gaya.
 7. **Padding** lead-in dan tail-out, supaya kalimat tidak terpotong di awal atau akhir clip. Tambahkan juga snap ke batas kata dari word timing.
 
-### P2: alur kerja dan UX
+### P2: alur kerja dan UX (8–11 selesai)
+
+> Sudah dikerjakan: halaman pilih dan edit highlight dengan preview, AI direction (rentang waktu diambil persis, temperature lebih rendah, analisis ulang tanpa transkripsi), hook text overlay, serta session dan Riwayat. Input URL YouTube (12) belum dikerjakan.
 
 8. **Halaman pilih highlight sebelum render.** Tampilkan daftar segmen dengan skor, judul, alasan, dan durasi. User mencentang yang mau dirender dan bisa mengedit start/end. Ini menghemat waktu render.
 9. **AI direction.**

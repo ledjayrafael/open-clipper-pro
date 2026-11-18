@@ -25,6 +25,10 @@
   - Seluruh audio ditranskripsi dulu, lalu AI membaca transkrip bertimestamp untuk memilih momen terbaik.
   - Tiap segmen mendapat `viral_score` 1–100 dan alasan singkat.
   - Backend memvalidasi hasil AI: memotong di batas kata, menjaga durasi sesuai pilihan (15–30, 30–60, atau 60–90 detik), dan membuang segmen yang tumpang tindih.
+- **Pilih dan edit sebelum render.** Daftar highlight dari AI bisa dicentang, diedit judul, hook, dan waktu mulai/selesainya, dan dipreview langsung di video sumber.
+- **Arahan untuk AI.** Tulis misalnya "fokus ke bagian soal bisnis" atau "ambil 2:00 - 2:50". Rentang waktu yang ditulis diambil persis. Hasil yang kurang cocok bisa dianalisis ulang tanpa upload atau transkripsi lagi.
+- **Hook text.** Kalimat pembuka dari AI (bisa diedit) tampil di 4 detik pertama clip.
+- **Riwayat.** Setiap video tersimpan sebagai session. Buka lagi kapan saja untuk render ulang atau menambah clip, atau hapus beserta semua clip-nya.
 - **Dua mode AI.** Pilih langsung di aplikasi:
   - **OpenRouter** (cloud, default model Gemini Flash Lite).
   - **Ollama** (lokal, tanpa API key, misalnya `gemma4:e4b`).
@@ -42,14 +46,15 @@
 ```
 Browser (React + Vite)                Backend lokal (Node, port 3030)
 ──────────────────────                ────────────────────────────────
-Klik "Jadikan Clip Viral" ──────────▶ /api/process (upload video + pengaturan)
+Klik "Cari Highlight Viral" ────────▶ POST /api/sessions (upload video + pengaturan + arahan)
                                       ├─ Groq Whisper: transkrip seluruh video (per 10 menit)
-                                      ├─ OpenRouter  atau  Ollama: pilih segmen dari transkrip
-                                      ├─ validasi: batas kata, durasi, overlap
-                                      ├─ FFmpeg: potong segmen + crop 9:16
-                                      ├─ MediaPipe: cari posisi wajah
-                                      └─ SSE: kirim progres ke browser
+                                      ├─ OpenRouter  atau  Ollama: usulkan highlight dari transkrip
+                                      └─ validasi: batas kata, durasi, overlap, rentang yang diminta
+Pilih + edit highlight ─────────────▶ POST /api/sessions/:id/render
+                                      ├─ FFmpeg: potong segmen + crop 9:16 + hook text
+                                      └─ MediaPipe: cari posisi wajah
 Generate Subtitle ──────────────────▶ word timing tersimpan ──▶ ASS ──▶ FFmpeg burn-in
+(semua progres dikirim lewat SSE)
 Simpan Video ◀────────────────────── /outputs/*.mp4
 ```
 
@@ -132,9 +137,10 @@ Lalu buka <http://localhost:5173>.
 
 1. **Pilih video.** Upload MP4, MOV, AVI, atau WebM.
 2. **Preview.** Cek video sumber.
-3. **Proses.** Pilih mode AI, jumlah clip, dan durasi per clip. Nyalakan atau matikan *Auto Face Detection*, lalu klik **Jadikan Clip Viral**.
-4. **Atur subtitle per clip.** Sesuaikan ukuran dan posisi Y, lalu klik **Generate Subtitle**.
-5. **Simpan Video.** Unduh clip yang sudah jadi.
+3. **Cari highlight.** Pilih mode AI, jumlah clip, durasi per clip, dan (opsional) tulis arahan untuk AI. Klik **Cari Highlight Viral**.
+4. **Pilih highlight.** Centang yang mau dirender, edit judul, hook, atau waktunya, dan klik **Preview** untuk mengecek. Kalau kurang cocok, pakai **Analisis ulang** dengan arahan lain. Lalu klik **Render**.
+5. **Atur subtitle per clip.** Sesuaikan ukuran dan posisi Y, lalu klik **Generate Subtitle**.
+6. **Simpan Video.** Unduh clip yang sudah jadi. Semua session bisa dibuka lagi dari **Riwayat**.
 
 ## Struktur project
 
@@ -142,7 +148,9 @@ Lalu buka <http://localhost:5173>.
 server/local-ffmpeg-server.mjs   backend: potong clip, subtitle, AI, SSE
 server/face_detect.py            helper deteksi wajah MediaPipe
 server/requirements.txt          dependensi Python
-src/App.jsx                      UI React
+src/App.jsx                      UI React (alur utama)
+src/components/HighlightReview.jsx  daftar highlight yang bisa diedit
+src/components/Library.jsx       riwayat session
 public/openclipper.png          logo
 vite.config.js                   proxy /api dan /outputs ke backend
 ```
@@ -157,6 +165,10 @@ vite.config.js                   proxy /api dan /outputs ke backend
 | Tombol Ollama nonaktif | Ollama belum jalan (`ollama serve`) atau belum ada model (`ollama pull …`). |
 | OpenRouter error 401/429 | Key salah atau terkena rate limit. Cek `OPENROUTER_API_KEY` di `.env`. |
 | Vite: *Cannot find native binding* | `node_modules` dipasang di OS lain. Hapus `node_modules` lalu jalankan `npm install` lagi. |
+
+## Penyimpanan
+
+Hasil clip ada di `local-exports/`. Setiap session menyimpan salinan video sumber dan transkripnya di `local-exports/.sessions/<id>/`, supaya bisa dibuka dan dirender ulang tanpa upload lagi. Hapus session dari **Riwayat** untuk mengosongkan ruang disk. Clip, subtitle, dan salinan videonya ikut terhapus.
 
 ## Privasi
 
