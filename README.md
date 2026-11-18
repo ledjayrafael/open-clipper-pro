@@ -14,6 +14,7 @@
   <img alt="Vite 8" src="https://img.shields.io/badge/Vite-8-646cff?logo=vite&logoColor=white" />
   <img alt="FFmpeg" src="https://img.shields.io/badge/FFmpeg-local-007808?logo=ffmpeg&logoColor=white" />
   <img alt="AI" src="https://img.shields.io/badge/AI-OpenRouter%20%7C%20Ollama-6d28d9" />
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/License-MIT-yellow.svg" /></a>
 </p>
 
 ---
@@ -160,3 +161,7 @@ Video diproses di komputer kamu sendiri. Ada dua hal yang keluar dari komputer:
 - Ke Groq: audio clip, kalau `GROQ_API_KEY` diisi.
 
 Proses hanya video yang kamu miliki atau punya hak untuk mengeditnya.
+
+## Lisensi
+
+Dirilis di bawah [MIT License](LICENSE).
