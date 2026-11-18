@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="public/open-clipper.png" alt="Open Clipper Pro" width="140" />
+  <img src="public/openclipper.png" alt="Open Clipper Pro" width="140" />
 </p>
 
 <h1 align="center">Open Clipper Pro</h1>
@@ -137,7 +137,7 @@ server/local-ffmpeg-server.mjs   backend: potong clip, subtitle, AI, SSE
 server/face_detect.py            helper deteksi wajah MediaPipe
 server/requirements.txt          dependensi Python
 src/App.jsx                      UI React
-public/open-clipper.png          logo
+public/openclipper.png          logo
 vite.config.js                   proxy /api dan /outputs ke backend
 ```
 

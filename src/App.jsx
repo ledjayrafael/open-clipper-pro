@@ -340,7 +340,7 @@ Format JSON MURNI:
       <div className="max-w-5xl mx-auto p-6 md:p-12">
         {/* Header */}
         <header className="mb-10 flex flex-col items-center text-center">
-          <img src="/open-clipper.png" alt="" width="96" height="96" className="w-20 h-20 md:w-24 md:h-24 mb-3 drop-shadow-[0_8px_24px_rgba(99,102,241,0.25)]" />
+          <img src="/openclipper.png" alt="" width="95" height="96" className="h-20 md:h-24 w-auto mb-3 drop-shadow-[0_8px_24px_rgba(255,255,255,0.12)]" />
           <h1 className="text-4xl md:text-6xl font-black tracking-tighter text-white leading-none">
             Open Clipper <span className="text-indigo-400">Pro</span>
           </h1>
