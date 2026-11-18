@@ -365,6 +365,52 @@ Format JSON MURNI:
               </div>
             )}
 
+            {/* AI mode: always visible so it can be chosen before upload */}
+            <div className="bg-[#0A0A0A] border border-slate-800/60 rounded-3xl p-6">
+              <p className="text-[10px] font-black uppercase tracking-widest text-slate-500 mb-2">Mode AI</p>
+              <div role="radiogroup" aria-label="Mode AI" className="grid grid-cols-2 gap-2 p-1 bg-slate-900/60 border border-slate-800 rounded-xl">
+                {[
+                  { id: 'openrouter', label: 'OpenRouter', hint: 'Cloud', off: 'Key belum diset' },
+                  { id: 'ollama', label: 'Ollama', hint: 'Lokal', off: aiProviders?.ollama.running ? 'Belum ada model' : 'Tidak terdeteksi' },
+                ].map(opt => {
+                  const available = aiProviders ? aiProviders[opt.id].available : true;
+                  const active = aiProvider === opt.id;
+                  return (
+                    <button
+                      key={opt.id}
+                      type="button"
+                      role="radio"
+                      aria-checked={active}
+                      disabled={!available || status === 'processing'}
+                      onClick={() => setAiProvider(opt.id)}
+                      title={available ? undefined : opt.off}
+                      className={`py-2.5 px-3 rounded-lg text-left transition-colors disabled:opacity-40 disabled:cursor-not-allowed ${active ? 'bg-indigo-600 text-white' : 'text-slate-300 hover:bg-slate-800'}`}
+                    >
+                      <span className="block text-xs font-black">{opt.label}</span>
+                      <span className={`block text-[10px] font-bold ${active ? 'text-indigo-200' : 'text-slate-500'}`}>
+                        {available ? opt.hint : opt.off}
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+              {aiProvider === 'ollama' && aiProviders?.ollama.models.length > 0 && (
+                <div className="mt-3">
+                  <label htmlFor="ollama-model" className="block text-[10px] font-black uppercase tracking-widest text-slate-500 mb-1">Model lokal</label>
+                  <select
+                    id="ollama-model"
+                    value={ollamaModel}
+                    onChange={e => setOllamaModel(e.target.value)}
+                    disabled={status === 'processing'}
+                    className="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-sm font-bold text-slate-200 focus:outline-none focus:border-indigo-500"
+                  >
+                    {aiProviders.ollama.models.map(m => <option key={m} value={m}>{m}</option>)}
+                  </select>
+                  <p className="mt-1 text-[10px] text-slate-500">Model lokal lebih lambat; analisis bisa makan 1–3 menit.</p>
+                </div>
+              )}
+            </div>
+
             {/* STEP 1: Upload Video */}
             <div className="bg-[#0A0A0A] border border-slate-800/60 rounded-3xl p-8">
               <div className="flex items-center gap-3 mb-6">
@@ -457,51 +503,6 @@ Format JSON MURNI:
                 <div className="flex items-center gap-3 mb-6">
                   <span className="bg-indigo-600 text-white text-[10px] font-black w-6 h-6 flex items-center justify-center rounded-full">3</span>
                   <h2 className="text-sm font-black uppercase tracking-widest">Proses</h2>
-                </div>
-
-                <div className="mb-5">
-                  <p className="text-[10px] font-black uppercase tracking-widest text-slate-500 mb-2">Mode AI</p>
-                  <div role="radiogroup" aria-label="Mode AI" className="grid grid-cols-2 gap-2 p-1 bg-slate-900/60 border border-slate-800 rounded-xl">
-                    {[
-                      { id: 'openrouter', label: 'OpenRouter', hint: 'Cloud', off: 'Key belum diset' },
-                      { id: 'ollama', label: 'Ollama', hint: 'Lokal', off: aiProviders?.ollama.running ? 'Belum ada model' : 'Tidak terdeteksi' },
-                    ].map(opt => {
-                      const available = aiProviders ? aiProviders[opt.id].available : true;
-                      const active = aiProvider === opt.id;
-                      return (
-                        <button
-                          key={opt.id}
-                          type="button"
-                          role="radio"
-                          aria-checked={active}
-                          disabled={!available || status === 'processing'}
-                          onClick={() => setAiProvider(opt.id)}
-                          title={available ? undefined : opt.off}
-                          className={`py-2.5 px-3 rounded-lg text-left transition-colors disabled:opacity-40 disabled:cursor-not-allowed ${active ? 'bg-indigo-600 text-white' : 'text-slate-300 hover:bg-slate-800'}`}
-                        >
-                          <span className="block text-xs font-black">{opt.label}</span>
-                          <span className={`block text-[10px] font-bold ${active ? 'text-indigo-200' : 'text-slate-500'}`}>
-                            {available ? opt.hint : opt.off}
-                          </span>
-                        </button>
-                      );
-                    })}
-                  </div>
-                  {aiProvider === 'ollama' && aiProviders?.ollama.models.length > 0 && (
-                    <div className="mt-3">
-                      <label htmlFor="ollama-model" className="block text-[10px] font-black uppercase tracking-widest text-slate-500 mb-1">Model lokal</label>
-                      <select
-                        id="ollama-model"
-                        value={ollamaModel}
-                        onChange={e => setOllamaModel(e.target.value)}
-                        disabled={status === 'processing'}
-                        className="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-sm font-bold text-slate-200 focus:outline-none focus:border-indigo-500"
-                      >
-                        {aiProviders.ollama.models.map(m => <option key={m} value={m}>{m}</option>)}
-                      </select>
-                      <p className="mt-1 text-[10px] text-slate-500">Model lokal lebih lambat; analisis bisa makan 1–3 menit.</p>
-                    </div>
-                  )}
                 </div>
 
                 <div className="flex items-center gap-3 mb-4">
