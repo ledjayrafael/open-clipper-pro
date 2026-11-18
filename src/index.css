@@ -1,1 +1,44 @@
 @import "tailwindcss";
+
+/* Browser surfaces themed from the app's palette (dark, indigo accent). */
+:root {
+  color-scheme: dark;
+  accent-color: #6366f1;
+  scrollbar-color: #334155 #050505;
+}
+
+body {
+  background: #050505;
+  caret-color: #818cf8;
+}
+
+::selection {
+  background: rgb(99 102 241 / 0.35);
+  color: #fff;
+}
+
+:focus-visible {
+  outline: 2px solid #818cf8;
+  outline-offset: 2px;
+}
+
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible {
+  outline-offset: 0;
+}
+
+::placeholder {
+  color: #64748b;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+  }
+}
