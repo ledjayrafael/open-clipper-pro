@@ -339,11 +339,12 @@ Format JSON MURNI:
 
       <div className="max-w-5xl mx-auto p-6 md:p-12">
         {/* Header */}
-        <header className="mb-10 text-center">
-          <h1 className="text-5xl md:text-6xl font-black italic tracking-tighter bg-gradient-to-r from-white via-indigo-200 to-slate-600 bg-clip-text text-transparent uppercase">
-            Clipper.Pro
+        <header className="mb-10 flex flex-col items-center text-center">
+          <img src="/open-clipper.png" alt="" width="96" height="96" className="w-20 h-20 md:w-24 md:h-24 mb-3 drop-shadow-[0_8px_24px_rgba(99,102,241,0.25)]" />
+          <h1 className="text-4xl md:text-6xl font-black tracking-tighter text-white leading-none">
+            Open Clipper <span className="text-indigo-400">Pro</span>
           </h1>
-          <p className="text-slate-500 font-bold mt-2 uppercase tracking-[0.2em] text-[10px]">AI Viral Clip Generator // Local Processing</p>
+          <p className="text-slate-500 font-bold mt-3 uppercase tracking-[0.2em] text-[10px]">AI Viral Clip Generator // Local Processing</p>
         </header>
 
         {status === 'loading-lib' ? (
@@ -644,7 +645,7 @@ Format JSON MURNI:
       </div>
 
       <footer className="max-w-5xl mx-auto mt-16 pb-12 border-t border-slate-900/50 pt-8 text-center opacity-10 text-[9px] font-black uppercase tracking-[0.5em] text-slate-500">
-        <p>CLIPPER.PRO // LOCAL AI ENGINE v7.0</p>
+        <p>OPEN CLIPPER PRO // LOCAL AI ENGINE v7.0</p>
       </footer>
     </div>
   );

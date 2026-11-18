@@ -426,7 +426,7 @@ const parseMultipart = (req) => new Promise((resolve, reject) => {
   const fields = {};
   let videoPath = null;
   let videoName = 'video.mp4';
-  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'clipper-'));
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'open-clipper-'));
 
   busboy.on('field', (name, value) => {
     fields[name] = value;
@@ -805,5 +805,5 @@ const server = http.createServer(async (req, res) => {
 
 // Bind to loopback only so other devices on the network cannot use the server (and its API keys).
 server.listen(PORT, '127.0.0.1', () => {
-  console.log(`Local FFmpeg server running on http://localhost:${PORT}`);
+  console.log(`Open Clipper Pro server running on http://localhost:${PORT}`);
 });
