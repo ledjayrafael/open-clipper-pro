@@ -37,6 +37,7 @@ export default function App() {
   const [isPlaying, setIsPlaying] = useState(false);
   const [isMuted, setIsMuted] = useState(false);
   const [engineMode, setEngineMode] = useState('checking');
+  const [encoderLabel, setEncoderLabel] = useState('');
   const [aiProviders, setAiProviders] = useState(null);
   const [aiProvider, setAiProvider] = useState(() => readPref('clipper.aiProvider', ''));
   const [ollamaModel, setOllamaModel] = useState(() => readPref('clipper.ollamaModel', ''));
@@ -61,7 +62,7 @@ export default function App() {
         setAiProvider(prev => {
           if (prev && data[prev]?.available) return prev;
           if (data[data.default]?.available) return data.default;
-          return data.openrouter.available ? 'openrouter' : data.ollama.available ? 'ollama' : (prev || data.default);
+          return ['openrouter', 'ollama', 'custom'].find(id => data[id]?.available) || prev || data.default;
         });
         setOllamaModel(prev => (data.ollama.models.includes(prev) ? prev : data.ollama.defaultModel));
       })
@@ -76,7 +77,9 @@ export default function App() {
   useEffect(() => { writePref('clipper.reframe', reframeMode); }, [reframeMode]);
   useEffect(() => { writePref('clipper.karaoke', karaoke ? '1' : '0'); }, [karaoke]);
 
-  const aiLabel = aiProvider === 'ollama' ? `Ollama · ${ollamaModel || 'lokal'}` : 'OpenRouter';
+  const aiLabel = aiProvider === 'ollama' ? `Ollama · ${ollamaModel || 'lokal'}`
+    : aiProvider === 'custom' ? `${aiProviders?.custom?.name || 'Custom'} · ${aiProviders?.custom?.model || ''}`
+    : 'OpenRouter';
 
   // 1. Detect backend local FFmpeg server
   useEffect(() => {
@@ -90,6 +93,7 @@ export default function App() {
         }
         const payload = await response.json();
         setEngineMode(payload.mode || 'system-ffmpeg');
+        setEncoderLabel(payload.encoder || '');
         setFfmpegLoaded(true);
         setStatus('idle');
       } catch (err) {
@@ -377,6 +381,7 @@ export default function App() {
         <span className="flex items-center gap-1.5">
           <Cpu size={12} className={ffmpegLoaded ? "text-green-400 animate-pulse" : "text-slate-500"} />
           ENGINE: {ffmpegLoaded ? engineMode.toUpperCase() : "OFFLINE"}
+          {ffmpegLoaded && encoderLabel && <span className="text-slate-500">· {encoderLabel.toUpperCase()}</span>}
         </span>
       </div>
 
@@ -411,10 +416,14 @@ export default function App() {
             {/* AI mode: always visible so it can be chosen before upload */}
             <div className="bg-[#0A0A0A] border border-slate-800/60 rounded-3xl p-6">
               <p className="text-[10px] font-black uppercase tracking-widest text-slate-500 mb-2">Mode AI</p>
-              <div role="radiogroup" aria-label="Mode AI" className="grid grid-cols-2 gap-2 p-1 bg-slate-900/60 border border-slate-800 rounded-xl">
+              <div role="radiogroup" aria-label="Mode AI" className={`grid ${aiProviders?.custom?.available ? 'grid-cols-3' : 'grid-cols-2'} gap-2 p-1 bg-slate-900/60 border border-slate-800 rounded-xl`}>
                 {[
                   { id: 'openrouter', label: 'OpenRouter', hint: 'Cloud', off: 'Key belum diset' },
                   { id: 'ollama', label: 'Ollama', hint: 'Lokal', off: aiProviders?.ollama.running ? 'Belum ada model' : 'Tidak terdeteksi' },
+                  // OpenAI-compatible endpoint from .env; only shown once configured.
+                  ...(aiProviders?.custom?.available ? [{
+                    id: 'custom', label: aiProviders.custom.name, hint: aiProviders.custom.model, off: '',
+                  }] : []),
                 ].map(opt => {
                   const available = aiProviders ? aiProviders[opt.id].available : true;
                   const active = aiProvider === opt.id;
@@ -430,7 +439,7 @@ export default function App() {
                       className={`py-2.5 px-3 rounded-lg text-left transition-colors disabled:opacity-40 disabled:cursor-not-allowed ${active ? 'bg-indigo-600 text-white' : 'text-slate-300 hover:bg-slate-800'}`}
                     >
                       <span className="block text-xs font-black">{opt.label}</span>
-                      <span className={`block text-[10px] font-bold ${active ? 'text-indigo-200' : 'text-slate-500'}`}>
+                      <span className={`block truncate text-[10px] font-bold ${active ? 'text-indigo-200' : 'text-slate-500'}`}>
                         {available ? opt.hint : opt.off}
                       </span>
                     </button>

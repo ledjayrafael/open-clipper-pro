@@ -28,8 +28,27 @@ const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || '';
 const OPENROUTER_MODEL = process.env.OPENROUTER_MODEL || 'google/gemini-3.1-flash-lite-preview';
 const OLLAMA_URL = (process.env.OLLAMA_URL || 'http://127.0.0.1:11434').replace(/\/+$/, '');
 const OLLAMA_MODEL = process.env.OLLAMA_MODEL || '';
-const AI_PROVIDER = process.env.AI_PROVIDER === 'ollama' ? 'ollama' : 'openrouter';
-if (!OPENROUTER_API_KEY) console.warn('OPENROUTER_API_KEY belum diset (lihat .env.example). Mode OpenRouter tidak tersedia; mode Ollama tetap bisa dipakai.');
+// Any OpenAI-compatible chat API: OpenAI, Gemini, Groq, LM Studio, vLLM, ...
+const CUSTOM_AI_BASE_URL = (process.env.CUSTOM_AI_BASE_URL || '').trim().replace(/\/+$/, '');
+const CUSTOM_AI_API_KEY = process.env.CUSTOM_AI_API_KEY || '';
+const CUSTOM_AI_MODEL = process.env.CUSTOM_AI_MODEL || '';
+const CUSTOM_AI_NAME = process.env.CUSTOM_AI_NAME || 'Custom';
+// Optional output budget; reasoning models can spend the default on thinking.
+const CUSTOM_AI_MAX_TOKENS = Number(process.env.CUSTOM_AI_MAX_TOKENS) || 0;
+const CUSTOM_AI_READY = Boolean(CUSTOM_AI_BASE_URL && CUSTOM_AI_MODEL);
+const AI_PROVIDERS = ['openrouter', 'ollama', 'custom'];
+const AI_PROVIDER = AI_PROVIDERS.includes(process.env.AI_PROVIDER) ? process.env.AI_PROVIDER : 'openrouter';
+// Video encoder: cpu (default), auto (use a working GPU encoder), or an FFmpeg
+// encoder name such as h264_nvenc. CPU is the default because decoding and the
+// crop/scale/subtitle filters run on the CPU anyway: on a desktop CPU libx264
+// veryfast measured faster than NVENC and gave files about half the size.
+// A GPU encoder mainly helps on machines with a weak CPU.
+const VIDEO_ENCODER = (process.env.VIDEO_ENCODER || 'cpu').trim();
+const VAAPI_DEVICE = process.env.VAAPI_DEVICE || '/dev/dri/renderD128';
+// Kill an FFmpeg encode whose progress has not moved for this long.
+const FFMPEG_STALL_SECONDS = Number(process.env.FFMPEG_STALL_SECONDS) || 120;
+if (!OPENROUTER_API_KEY) console.warn('OPENROUTER_API_KEY belum diset (lihat .env.example). Mode OpenRouter tidak tersedia; mode Ollama atau provider custom tetap bisa dipakai.');
+if (CUSTOM_AI_BASE_URL && !CUSTOM_AI_MODEL) console.warn('CUSTOM_AI_BASE_URL diset tanpa CUSTOM_AI_MODEL, jadi provider custom tidak aktif.');
 // Whisper language hint; set WHISPER_LANGUAGE= (empty) in .env for auto-detect.
 const WHISPER_LANGUAGE = process.env.WHISPER_LANGUAGE ?? 'id';
 // Full-video transcription is sent to Groq in chunks of this many seconds.
@@ -51,26 +70,112 @@ async function listOllamaModels() {
   }
 }
 
-async function callOpenRouter(messages, { temperature } = {}) {
-  if (!OPENROUTER_API_KEY) throw httpError(500, 'OPENROUTER_API_KEY belum diset di .env server. Pakai mode Ollama atau isi key-nya.');
-  const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${OPENROUTER_API_KEY}` },
-    body: JSON.stringify({
-      model: OPENROUTER_MODEL, messages, response_format: { type: 'json_object' },
-      ...(temperature !== undefined ? { temperature } : {}),
-    }),
-    signal: AbortSignal.timeout(180000),
-  }).catch(error => {
-    if (error.name === 'TimeoutError') throw httpError(504, 'OpenRouter tidak menjawab dalam 3 menit. Coba lagi.');
-    throw httpError(502, `Gagal menghubungi OpenRouter: ${error.message}`);
-  });
-  if (!response.ok) {
-    const errText = await response.text().catch(() => '');
-    throw httpError(502, `OpenRouter error ${response.status}: ${errText.slice(0, 300)}`);
+// ---------------------------------------------------------------------------
+// HTTP calls to AI providers: retries for transient failures, and errors that
+// tell the user what to do.
+// ---------------------------------------------------------------------------
+
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+const RETRYABLE_STATUS = new Set([408, 425, 429, 500, 502, 503, 504]);
+const backoffMs = (attempt) => [2000, 6000, 15000][attempt - 1] ?? 15000;
+
+const explainApiError = (name, status, body) => {
+  const detail = String(body || '').replace(/\s+/g, ' ').trim().slice(0, 200);
+  const lower = detail.toLowerCase();
+  if (status === 401 || status === 403) return `${name} menolak API key (${status}). Cek key-nya di .env.`;
+  if (status === 402) return `Saldo atau kredit ${name} habis (402). Isi ulang, atau ganti provider/model.`;
+  if (status === 413 || /context length|context window|too long|maximum context|too large|max_tokens/.test(lower)) {
+    return `${name}: input terlalu besar untuk model ini (${status}). Pakai model dengan konteks lebih besar, atau video yang lebih pendek.`;
   }
-  const result = await response.json();
-  return result.choices?.[0]?.message?.content || '';
+  if (status === 404) return `${name}: model atau endpoint tidak ditemukan (404). Cek nama model dan alamat di .env. ${detail}`;
+  if (status === 429) return `${name} kena rate limit (429) dan masih gagal setelah dicoba ulang. Tunggu sebentar, atau ganti model.`;
+  if (status >= 500) return `${name} sedang error (${status}) dan masih gagal setelah dicoba ulang. Coba lagi nanti, atau ganti model.`;
+  return `${name} error ${status}: ${detail}`;
+};
+
+// fetch() that retries rate limits, server errors and network failures with
+// backoff (honouring a short Retry-After), then throws an explained error.
+async function fetchWithRetry(url, makeInit, { name, timeoutMs, attempts = 3 }) {
+  let lastError;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    let response;
+    try {
+      response = await fetch(url, { ...makeInit(), signal: AbortSignal.timeout(timeoutMs) });
+    } catch (error) {
+      lastError = error.name === 'TimeoutError'
+        ? httpError(504, `${name} tidak menjawab dalam ${Math.round(timeoutMs / 60000)} menit, juga setelah dicoba ulang.`)
+        : httpError(502, `Gagal menghubungi ${name} (${error.cause?.code || error.message}). Cek koneksi internet atau alamat server.`);
+      if (attempt < attempts) { await sleep(backoffMs(attempt)); continue; }
+      throw lastError;
+    }
+    if (response.ok) return response;
+
+    const body = await response.text().catch(() => '');
+    lastError = Object.assign(httpError(response.status >= 500 ? 502 : response.status, explainApiError(name, response.status, body)), {
+      status: response.status, body,
+    });
+    if (!RETRYABLE_STATUS.has(response.status) || attempt === attempts) throw lastError;
+    const retryAfter = Number(response.headers.get('retry-after'));
+    console.warn(`${name} ${response.status}, retry ${attempt}/${attempts - 1}`);
+    await sleep(retryAfter > 0 && retryAfter <= 30 ? retryAfter * 1000 : backoffMs(attempt));
+  }
+  throw lastError;
+}
+
+// OpenAI-style /chat/completions, used for OpenRouter and the custom provider.
+async function callChatApi({ name, url, apiKey, model, messages, temperature, maxTokens }) {
+  const send = (jsonMode) => fetchWithRetry(url, () => ({
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}) },
+    body: JSON.stringify({
+      model, messages,
+      ...(jsonMode ? { response_format: { type: 'json_object' } } : {}),
+      ...(temperature !== undefined ? { temperature } : {}),
+      ...(maxTokens ? { max_tokens: maxTokens } : {}),
+    }),
+  }), { name, timeoutMs: 180000 });
+
+  let response;
+  try {
+    response = await send(true);
+  } catch (error) {
+    // Some compatible servers do not support JSON mode, or reject the model's
+    // output in it (Groq: json_validate_failed). Ask again without it; our own
+    // parser salvages the JSON from a plain answer.
+    if (error.status === 400 && /response_format|json_object|json mode|json_validate_failed|failed to validate json/i.test(error.body || '')) {
+      response = await send(false);
+    }
+    else throw error;
+  }
+  const result = await response.json().catch(() => null);
+  const choice = result?.choices?.[0];
+  const content = choice?.message?.content || '';
+  if (!content.trim()) {
+    if (choice?.finish_reason === 'length') {
+      // The answer hit a token limit before any text: either a small context
+      // window (Ollama's OpenAI endpoint uses 4096) or a reasoning model that
+      // spent its output budget thinking.
+      throw httpError(502, `${name} berhenti di batas token sebelum menjawab (${result?.usage?.total_tokens ?? '?'} token). Untuk model reasoning, naikkan CUSTOM_AI_MAX_TOKENS di .env. Kalau konteks server kecil, naikkan context length-nya atau pakai model lain. Untuk Ollama, pakai mode Ollama (konteksnya diatur otomatis).`);
+    }
+    throw httpError(502, `${name} menjawab kosong. Model mungkin menolak permintaan atau kuotanya habis. Coba lagi, atau ganti model.`);
+  }
+  return content;
+}
+
+async function callOpenRouter(messages, { temperature } = {}) {
+  if (!OPENROUTER_API_KEY) throw httpError(500, 'OPENROUTER_API_KEY belum diset di .env server. Pakai mode Ollama/custom atau isi key-nya.');
+  return callChatApi({
+    name: 'OpenRouter', url: 'https://openrouter.ai/api/v1/chat/completions',
+    apiKey: OPENROUTER_API_KEY, model: OPENROUTER_MODEL, messages, temperature,
+  });
+}
+
+async function callCustomAi(messages, { temperature } = {}) {
+  if (!CUSTOM_AI_READY) throw httpError(500, 'Provider custom belum diset. Isi CUSTOM_AI_BASE_URL dan CUSTOM_AI_MODEL di .env.');
+  return callChatApi({
+    name: CUSTOM_AI_NAME, url: `${CUSTOM_AI_BASE_URL}/chat/completions`,
+    apiKey: CUSTOM_AI_API_KEY, model: CUSTOM_AI_MODEL, messages, temperature, maxTokens: CUSTOM_AI_MAX_TOKENS,
+  });
 }
 
 // Structured-output schema for Ollama. With plain format:'json' small local
@@ -141,7 +246,7 @@ const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
 // Containers without per-stream durations (mkv, webm) fall back to the format's.
 const probeDuration = async (filePath) => {
   const read = async (args) => {
-    const { stdout } = await runCommand('ffprobe', ['-v', 'error', ...args, '-of', 'default=nw=1:nk=1', filePath]);
+    const { stdout } = await runCommand('ffprobe', ['-v', 'error', ...args, '-of', 'default=nw=1:nk=1', filePath], { timeoutMs: 60000 });
     return Number(stdout.trim().split('\n')[0]) || 0;
   };
   const format = await read(['-show_entries', 'format=duration']);
@@ -158,16 +263,11 @@ async function groqTranscribe(audioPath, mimeType, fileName) {
   formData.append('timestamp_granularities[]', 'segment');
   if (WHISPER_LANGUAGE) formData.append('language', WHISPER_LANGUAGE);
 
-  const response = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
+  const response = await fetchWithRetry('https://api.groq.com/openai/v1/audio/transcriptions', () => ({
     method: 'POST',
     headers: { 'Authorization': `Bearer ${GROQ_API_KEY}` },
     body: formData,
-    signal: AbortSignal.timeout(300000),
-  });
-  if (!response.ok) {
-    const errText = await response.text().catch(() => '');
-    throw new Error(`Groq Whisper error ${response.status}: ${errText.slice(0, 300)}`);
-  }
+  }), { name: 'Groq Whisper', timeoutMs: 300000 });
   const result = await response.json();
   return { words: result.words || [], segments: result.segments || [], text: result.text || '' };
 }
@@ -184,7 +284,7 @@ async function transcribeFullVideo(videoPath, tempDir, duration, onChunk) {
     await runCommand('ffmpeg', [
       '-y', '-ss', String(offset), '-t', String(WHISPER_CHUNK_SECONDS), '-i', videoPath,
       '-vn', '-ac', '1', '-ar', '16000', '-c:a', 'libopus', '-b:a', '32k', audioPath,
-    ]);
+    ], { timeoutMs: 300000 });
     const result = await groqTranscribe(audioPath, 'audio/ogg', 'audio.ogg');
     await fsp.unlink(audioPath).catch(() => {});
     for (const w of result.words) {
@@ -546,6 +646,8 @@ async function findMoments({ provider, model, duration, transcript, count, minDu
     const promptChars = messages.reduce((n, m) => n + m.content.length, 0);
     const numCtx = clamp(Math.ceil(promptChars / 3) + 4096, 8192, 32768);
     content = await callOllama(messages, model, { schema: momentsSchema(requestCount, !transcript), numCtx, temperature: temperature ?? 0.4 });
+  } else if (provider === 'custom') {
+    content = await callCustomAi(messages, { temperature });
   } else {
     content = await callOpenRouter(messages, { temperature });
   }
@@ -576,50 +678,150 @@ const sendJson = (res, statusCode, payload) => {
   res.end(JSON.stringify(payload));
 };
 
-const runCommand = (command, args, options = {}) => new Promise((resolve, reject) => {
+// Run a command and collect its output. `timeoutMs` kills it if it hangs.
+const runCommand = (command, args, { timeoutMs, ...options } = {}) => new Promise((resolve, reject) => {
   const child = spawn(command, args, { windowsHide: true, ...options });
   let stdout = '';
   let stderr = '';
+  let timedOut = false;
+  const timer = timeoutMs ? setTimeout(() => { timedOut = true; child.kill('SIGKILL'); }, timeoutMs) : null;
 
-  child.stdout.on('data', chunk => {
-    stdout += chunk.toString();
-  });
-  child.stderr.on('data', chunk => {
-    stderr += chunk.toString();
-  });
-  child.on('error', reject);
+  child.stdout.on('data', chunk => { stdout += chunk.toString(); });
+  child.stderr.on('data', chunk => { stderr += chunk.toString(); });
+  child.on('error', error => { clearTimeout(timer); reject(error); });
   child.on('close', code => {
-    if (code === 0) {
-      resolve({ stdout, stderr });
-      return;
-    }
-    reject(new Error(stderr || stdout || `${command} exited with code ${code}`));
+    clearTimeout(timer);
+    if (timedOut) reject(new Error(`${path.basename(command)} tidak selesai dalam ${Math.round(timeoutMs / 1000)} detik dan dihentikan.`));
+    else if (code === 0) resolve({ stdout, stderr });
+    else reject(new Error(stderr || stdout || `${command} exited with code ${code}`));
   });
 });
 
+// Run FFmpeg with `-progress pipe:1`, reporting processed seconds. A watchdog
+// kills it when the output time stops advancing for FFMPEG_STALL_SECONDS
+// (a hung decoder, GPU driver or network input would otherwise wait forever).
 const runCommandWithProgress = (command, args, options = {}, onProgress) => new Promise((resolve, reject) => {
   const child = spawn(command, args, { windowsHide: true, ...options });
   let stderr = '';
   let stdoutBuf = '';
+  let lastTime = -1;
+  let lastAdvance = Date.now();
+  let stalled = false;
+
+  const watchdog = setInterval(() => {
+    if (Date.now() - lastAdvance > FFMPEG_STALL_SECONDS * 1000) {
+      stalled = true;
+      child.kill('SIGKILL');
+    }
+  }, 5000);
 
   child.stdout.on('data', chunk => {
     stdoutBuf += chunk.toString();
     const lines = stdoutBuf.split('\n');
     stdoutBuf = lines.pop() || '';
     for (const line of lines) {
-      if (onProgress && line.startsWith('out_time_ms=')) {
-        const us = parseInt(line.split('=')[1], 10);
-        if (!isNaN(us) && us >= 0) onProgress(us / 1000000);
+      if (!line.startsWith('out_time_ms=')) continue;
+      const us = parseInt(line.split('=')[1], 10);
+      if (isNaN(us) || us < 0) continue;
+      if (us > lastTime) {
+        lastTime = us;
+        lastAdvance = Date.now();
       }
+      onProgress?.(us / 1000000);
     }
   });
   child.stderr.on('data', chunk => { stderr += chunk.toString(); });
-  child.on('error', reject);
+  child.on('error', error => { clearInterval(watchdog); reject(error); });
   child.on('close', code => {
-    if (code === 0) resolve({ stdout: stdoutBuf, stderr });
-    else reject(new Error(stderr || `${command} exited with code ${code}`));
+    clearInterval(watchdog);
+    if (stalled) {
+      reject(Object.assign(new Error(`FFmpeg tidak bergerak selama ${FFMPEG_STALL_SECONDS} detik dan dihentikan. Coba lagi; kalau terulang, cek file videonya atau set VIDEO_ENCODER=cpu.`), { stalled: true }));
+    } else if (code === 0) {
+      resolve({ stdout: stdoutBuf, stderr });
+    } else {
+      reject(new Error(stderr.slice(-2000) || `${command} exited with code ${code}`));
+    }
   });
 });
+
+// ---------------------------------------------------------------------------
+// Video encoder: a GPU encoder when one works on this machine, else libx264.
+// ---------------------------------------------------------------------------
+
+const ENCODERS = {
+  libx264: { label: 'CPU (libx264)', args: ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23'] },
+  // cq 28 keeps NVENC files closer to libx264 crf 23 in size (cq 23 was ~2.5x larger).
+  h264_nvenc: { label: 'NVIDIA NVENC', args: ['-c:v', 'h264_nvenc', '-preset', 'p4', '-rc', 'vbr', '-cq', '28', '-b:v', '0'] },
+  h264_qsv: { label: 'Intel Quick Sync', args: ['-c:v', 'h264_qsv', '-preset', 'faster', '-global_quality', '23'] },
+  h264_amf: { label: 'AMD AMF', args: ['-c:v', 'h264_amf', '-quality', 'balanced', '-rc', 'cqp', '-qp_i', '23', '-qp_p', '23'] },
+  h264_videotoolbox: { label: 'Apple VideoToolbox', args: ['-c:v', 'h264_videotoolbox', '-b:v', '8M'] },
+  h264_vaapi: {
+    label: 'VAAPI', pre: ['-vaapi_device', VAAPI_DEVICE], vfSuffix: 'format=nv12,hwupload',
+    args: ['-c:v', 'h264_vaapi', '-qp', '23'],
+  },
+};
+const HW_ENCODER_ORDER = {
+  win32: ['h264_nvenc', 'h264_qsv', 'h264_amf'],
+  darwin: ['h264_videotoolbox'],
+  linux: ['h264_nvenc', 'h264_qsv', 'h264_vaapi'],
+};
+
+// Listed is not enough (a build can list NVENC on a machine without an NVIDIA
+// GPU), so each candidate encodes a tiny test clip before it is trusted.
+let encoderPromise = null;
+const pickEncoder = () => {
+  encoderPromise ??= (async () => {
+    if (['cpu', 'libx264'].includes(VIDEO_ENCODER)) return 'libx264';
+    const candidates = VIDEO_ENCODER !== 'auto' && ENCODERS[VIDEO_ENCODER]
+      ? [VIDEO_ENCODER]
+      : (HW_ENCODER_ORDER[process.platform] || []);
+    const { stdout: listed } = await runCommand('ffmpeg', ['-hide_banner', '-encoders'], { timeoutMs: 20000 }).catch(() => ({ stdout: '' }));
+    for (const name of candidates) {
+      if (!listed.includes(name)) continue;
+      const encoder = ENCODERS[name];
+      try {
+        await runCommand('ffmpeg', [
+          '-hide_banner', '-v', 'error', ...(encoder.pre || []),
+          '-f', 'lavfi', '-i', 'color=black:s=320x240:r=30:d=0.5',
+          ...(encoder.vfSuffix ? ['-vf', encoder.vfSuffix] : []),
+          ...encoder.args, '-f', 'null', '-',
+        ], { timeoutMs: 20000 });
+        console.log(`Video encoder: ${encoder.label} (${name})`);
+        return name;
+      } catch {
+        // not usable on this machine; try the next one
+      }
+    }
+    if (VIDEO_ENCODER !== 'auto') console.warn(`VIDEO_ENCODER=${VIDEO_ENCODER} tidak bisa dipakai, pakai CPU.`);
+    console.log('Video encoder: CPU (libx264)');
+    return 'libx264';
+  })();
+  return encoderPromise;
+};
+
+// Encode with the picked encoder. If a hardware encoder fails on a clip
+// (driver hiccup, unsupported size), that clip is redone once on the CPU.
+const runEncode = async ({ inputArgs, vf, audioArgs, outputPath, onProgress }) => {
+  const picked = await pickEncoder();
+  const build = (name) => {
+    const encoder = ENCODERS[name];
+    return [
+      '-y', ...(encoder.pre || []), ...inputArgs,
+      '-vf', encoder.vfSuffix ? `${vf},${encoder.vfSuffix}` : vf,
+      ...encoder.args, ...audioArgs,
+      '-movflags', '+faststart', '-progress', 'pipe:1', outputPath,
+    ];
+  };
+  try {
+    await runCommandWithProgress('ffmpeg', build(picked), {}, onProgress);
+    return picked;
+  } catch (error) {
+    if (picked === 'libx264') throw error;
+    console.error(`${picked} gagal, ulang dengan CPU:`, error.message.slice(-300));
+    await runCommandWithProgress('ffmpeg', build('libx264'), {}, onProgress);
+    return 'libx264';
+  }
+};
 
 // SSE job tracking
 const sseClients = new Map();
@@ -802,59 +1004,21 @@ const splitLongCaptions = (captions, clipDuration) => {
 };
 
 // Transcribe audio from a clip using Groq Whisper API
+// Fallback for clips without stored word timing (older clips): transcribe the clip.
 const transcribeClipAudio = async (clipPath, clipDuration) => {
-  // Extract audio to temporary WAV
-  const tempWav = clipPath + '.transcribe.wav';
+  const audioPath = `${clipPath}.transcribe.ogg`;
   await runCommand('ffmpeg', [
-    '-y', '-i', clipPath,
-    '-vn', '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1',
-    tempWav,
-  ]);
-
+    '-y', '-i', clipPath, '-vn', '-ac', '1', '-ar', '16000', '-c:a', 'libopus', '-b:a', '32k', audioPath,
+  ], { timeoutMs: 300000 });
   try {
-    const audioBuffer = await fsp.readFile(tempWav);
-    const formData = new FormData();
-    formData.append('file', new Blob([audioBuffer], { type: 'audio/wav' }), 'audio.wav');
-    formData.append('model', 'whisper-large-v3-turbo');
-    formData.append('response_format', 'verbose_json');
-    formData.append('timestamp_granularities[]', 'word');
-    formData.append('language', 'id');
-
-    const response = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
-      method: 'POST',
-      headers: { 'Authorization': `Bearer ${GROQ_API_KEY}` },
-      body: formData,
-    });
-
-    if (!response.ok) {
-      const errText = await response.text().catch(() => '');
-      throw new Error(`Groq Whisper API error ${response.status}: ${errText}`);
-    }
-
-    const result = await response.json();
-    const words = result.words || [];
-
-    if (words.length === 0) {
-      // Fallback: return full text as one caption
-      return result.text
-        ? [{ text: result.text, start_offset: 0, end_offset: clipDuration }]
-        : [];
-    }
-
-    // Group words into subtitle lines (2 words per line to fit narrow 9:16 video)
-    const WORDS_PER_LINE = 2;
-    const captions = [];
-    for (let i = 0; i < words.length; i += WORDS_PER_LINE) {
-      const chunk = words.slice(i, i + WORDS_PER_LINE);
-      captions.push({
-        text: chunk.map(w => w.word).join(' '),
-        start_offset: parseFloat(Number(chunk[0].start).toFixed(2)),
-        end_offset: parseFloat(Number(chunk[chunk.length - 1].end).toFixed(2)),
-      });
-    }
-    return captions;
+    const result = await groqTranscribe(audioPath, 'audio/ogg', 'audio.ogg');
+    const words = result.words
+      .map(w => ({ word: String(w.word || '').trim(), start: Number(w.start), end: Number(w.end) }))
+      .filter(w => w.word);
+    if (words.length) return wordsToCaptions(words);
+    return result.text ? [{ text: result.text, start_offset: 0, end_offset: clipDuration }] : [];
   } finally {
-    await fsp.unlink(tempWav).catch(() => {});
+    await fsp.unlink(audioPath).catch(() => {});
   }
 };
 
@@ -996,7 +1160,7 @@ const readJobSettings = (fields) => {
   if (maxDur <= minDur) maxDur = minDur + 10;
   return {
     count, minDur, maxDur,
-    provider: fields.provider === 'ollama' ? 'ollama' : fields.provider === 'openrouter' ? 'openrouter' : AI_PROVIDER,
+    provider: AI_PROVIDERS.includes(fields.provider) ? fields.provider : AI_PROVIDER,
     model: fields.model ? String(fields.model) : undefined,
     direction: sanitizeDirection(fields.direction),
   };
@@ -1067,7 +1231,9 @@ const analyzeSession = async (session, settings, { transcribe }, progress, tempD
   }
 
   const transcript = session.lines.length ? formatTranscript(session.lines) : '';
-  const aiName = settings.provider === 'ollama' ? `Ollama${settings.model ? ` · ${settings.model}` : ''}` : 'OpenRouter';
+  const aiName = settings.provider === 'ollama' ? `Ollama${settings.model ? ` · ${settings.model}` : ''}`
+    : settings.provider === 'custom' ? `${CUSTOM_AI_NAME} · ${CUSTOM_AI_MODEL}`
+    : 'OpenRouter';
   progress(`Analisis AI (${aiName})`, transcript ? `Membaca transkrip ${session.words.length} kata...` : 'Mencari segmen viral...', 65);
   const { candidates, stats } = await findMoments({
     ...settings, duration: session.duration, transcript, words: session.words, lines: session.lines,
@@ -1102,7 +1268,7 @@ const ffmpegFilePath = (filePath) => filePath.replace(/\\/g, '/').replace(/:/g, 
 const faceTrackFilter = async (videoPath, start, clipDuration, tempDir, index) => {
   const { stdout } = await runCommand(PYTHON_BIN, [
     path.join(ROOT_DIR, 'server', 'face_track.py'), videoPath, String(start), String(clipDuration),
-  ]);
+  ], { timeoutMs: 600000 });
   const track = JSON.parse(stdout.trim().split('\n').pop() || '{}');
   if (track.error) throw new Error(track.error);
   if (!track.x?.length || track.faces_found === 0) return { filter: CENTER_CROP, note: 'tidak ada wajah, crop tengah' };
@@ -1203,15 +1369,15 @@ const renderSession = async (session, items, options, progress, tempDir) => {
       vf += `,ass='${ffmpegFilePath(assPath)}'`;
     }
 
-    await runCommandWithProgress('ffmpeg', [
-      '-y', '-ss', String(start), '-i', videoPath, '-t', String(clipDuration),
-      '-vf', vf,
-      '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23',
-      '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart',
-      '-progress', 'pipe:1', outputPath,
-    ], {}, (processedSeconds) => {
-      const clipPct = Math.min(1, processedSeconds / Math.max(clipDuration, 0.1));
-      progress(step, `${Math.round(clipPct * 100)}% selesai`, Math.round(((i + clipPct) / items.length) * 98));
+    const encoder = await runEncode({
+      inputArgs: ['-ss', String(start), '-i', videoPath, '-t', String(clipDuration)],
+      vf,
+      audioArgs: ['-c:a', 'aac', '-b:a', '128k'],
+      outputPath,
+      onProgress: (processedSeconds) => {
+        const clipPct = Math.min(1, processedSeconds / Math.max(clipDuration, 0.1));
+        progress(step, `${Math.round(clipPct * 100)}% selesai`, Math.round(((i + clipPct) / items.length) * 98));
+      },
     });
 
     // Keep word timing so the subtitle step needs no second transcription.
@@ -1224,6 +1390,7 @@ const renderSession = async (session, items, options, progress, tempDir) => {
       title, hookText,
       reframe: options.reframe,
       reframeNote: reframe.note,
+      encoder: ENCODERS[encoder].label,
       reason: candidate?.reason || '',
       viralScore: candidate?.viralScore ?? null,
       start, end, duration: clipDuration,
@@ -1384,22 +1551,15 @@ const addSubtitleJob = async (jobId, inputPath, captions, subtitleSize, subtitle
     // On Windows, FFmpeg requires forward slashes and escaped colons in paths
     const assPathForFFmpeg = assPath.replace(/\\/g, '/').replace(/:/g, '\\:');
 
-    const args = [
-      '-y',
-      '-i', inputPath,
-      '-vf', `ass='${assPathForFFmpeg}'`,
-      '-c:v', 'libx264',
-      '-preset', 'veryfast',
-      '-crf', '23',
-      '-c:a', 'copy',
-      '-movflags', '+faststart',
-      '-progress', 'pipe:1',
+    await runEncode({
+      inputArgs: ['-i', inputPath],
+      vf: `ass='${assPathForFFmpeg}'`,
+      audioArgs: ['-c:a', 'copy'],
       outputPath,
-    ];
-
-    await runCommandWithProgress('ffmpeg', args, {}, (processedSeconds) => {
-      const pct = Math.min(100, Math.round((processedSeconds / Math.max(clipDuration, 0.1)) * 100));
-      sendSseEvent(jobId, 'progress', { step: 'Menambahkan subtitle...', detail: `${pct}%`, percent: Math.min(95, pct) });
+      onProgress: (processedSeconds) => {
+        const pct = Math.min(100, Math.round((processedSeconds / Math.max(clipDuration, 0.1)) * 100));
+        sendSseEvent(jobId, 'progress', { step: 'Menambahkan subtitle...', detail: `${pct}%`, percent: Math.min(95, pct) });
+      },
     });
 
     // Cleanup ASS file
@@ -1438,8 +1598,9 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === 'GET' && req.url === '/api/health') {
     try {
-      await runCommand('ffmpeg', ['-version']);
-      sendJson(res, 200, { ok: true, mode: 'system-ffmpeg' });
+      await runCommand('ffmpeg', ['-version'], { timeoutMs: 20000 });
+      const encoder = await pickEncoder();
+      sendJson(res, 200, { ok: true, mode: 'system-ffmpeg', encoder: ENCODERS[encoder].label });
     } catch (error) {
       sendJson(res, 500, { ok: false, error: error.message });
     }
@@ -1452,6 +1613,12 @@ const server = http.createServer(async (req, res) => {
       ok: true,
       default: AI_PROVIDER,
       openrouter: { available: Boolean(OPENROUTER_API_KEY), model: OPENROUTER_MODEL },
+      custom: {
+        available: CUSTOM_AI_READY,
+        name: CUSTOM_AI_NAME,
+        model: CUSTOM_AI_MODEL,
+        host: CUSTOM_AI_READY ? (() => { try { return new URL(CUSTOM_AI_BASE_URL).host; } catch { return ''; } })() : '',
+      },
       ollama: {
         available: models !== null && models.length > 0,
         running: models !== null,

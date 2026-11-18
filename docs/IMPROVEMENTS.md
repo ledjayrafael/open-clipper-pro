@@ -78,7 +78,11 @@ Yang **sudah lebih baik** di Open Clipper Pro dan perlu dipertahankan:
     - Library menampilkan riwayat, supaya refresh halaman tidak menghilangkan hasil.
 12. **Input URL YouTube (opsional).** Gunakan yt-dlp dan unduh hanya section yang dipilih (`--download-sections`). Wajib ada disclaimer hak cipta, seperti di referensi.
 
-### P3: performa dan ketahanan
+### P3: performa dan ketahanan (selesai)
+
+> Sudah dikerjakan: encoder GPU dengan probe dan fallback ke CPU per clip (opsional lewat `VIDEO_ENCODER`), parser JSON salvage (sejak P0), retry dengan backoff dan pesan error yang bisa ditindaklanjuti untuk OpenRouter, provider custom, dan Groq, watchdog FFmpeg dan timeout proses, serta provider generik yang kompatibel OpenAI.
+>
+> Catatan pengukuran (RTX 3060, CPU desktop, sumber 1080p60): NVENC 30–40% **lebih lambat** dari libx264 veryfast, dan filenya 1,3–2,5x lebih besar, karena decode dan filter tetap jalan di CPU. Karena itu default-nya CPU, dan GPU hanya opsi untuk mesin dengan CPU lemah.
 
 13. **Hardware encoder.** Deteksi `h264_nvenc`, `h264_qsv`, `h264_amf`, atau `h264_vaapi` (Linux) dengan percobaan encode 1 frame, lalu fallback ke `libx264`.
 14. **Parser JSON yang lebih toleran.** Hilangkan pagar ```` ``` ````, coba `JSON.parse`, dan kalau gagal, salvage per objek `{…}` (lihat `parse_highlights_json`).

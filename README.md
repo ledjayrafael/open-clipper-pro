@@ -29,9 +29,11 @@
 - **Arahan untuk AI.** Tulis misalnya "fokus ke bagian soal bisnis" atau "ambil 2:00 - 2:50". Rentang waktu yang ditulis diambil persis. Hasil yang kurang cocok bisa dianalisis ulang tanpa upload atau transkripsi lagi.
 - **Hook text.** Kalimat pembuka dari AI (bisa diedit) tampil di 4 detik pertama clip.
 - **Riwayat.** Setiap video tersimpan sebagai session. Buka lagi kapan saja untuk render ulang atau menambah clip, atau hapus beserta semua clip-nya.
-- **Dua mode AI.** Pilih langsung di aplikasi:
+- **Tiga mode AI.** Pilih langsung di aplikasi:
   - **OpenRouter** (cloud, default model Gemini Flash Lite).
   - **Ollama** (lokal, tanpa API key, misalnya `gemma4:e4b`).
+  - **Custom:** API apa pun yang kompatibel dengan OpenAI (OpenAI, Gemini, Groq, LM Studio, vLLM, ...), diatur lewat `.env`.
+- **Tahan gangguan.** Rate limit, server error, dan koneksi putus ke AI atau Groq dicoba ulang otomatis, dan pesan error menjelaskan apa yang harus dilakukan. FFmpeg yang macet dihentikan oleh watchdog.
 - **Potong 9:16 dengan FFmpeg** langsung di mesin kamu.
 - **Reframe 9:16** dengan empat pilihan:
   - **Ikuti wajah:** crop bergerak halus mengikuti wajah utama (MediaPipe), langsung pindah saat kamera berganti, dan tidak bolak-balik antar orang dalam satu shot.
@@ -110,7 +112,14 @@ Salin `.env.example` menjadi `.env` di root project, lalu isi:
 | `GROQ_API_KEY` | sangat disarankan | Transkripsi Whisper. Dipakai AI untuk memilih segmen dan untuk subtitle. Tanpa key ini, AI hanya melihat durasi video. |
 | `WHISPER_LANGUAGE` | opsional | Bahasa audio, default `id`. Kosongkan (`WHISPER_LANGUAGE=`) untuk deteksi otomatis. |
 | `OPENROUTER_MODEL` | opsional | Default `google/gemini-3.1-flash-lite-preview` |
-| `AI_PROVIDER` | opsional | Mode awal: `openrouter` atau `ollama` |
+| `AI_PROVIDER` | opsional | Mode awal: `openrouter`, `ollama`, atau `custom` |
+| `CUSTOM_AI_BASE_URL` | untuk mode Custom | Alamat API yang kompatibel OpenAI, tanpa `/chat/completions`. Contoh: `https://api.openai.com/v1`, `http://127.0.0.1:1234/v1` (LM Studio). |
+| `CUSTOM_AI_MODEL` | untuk mode Custom | Nama model di provider itu |
+| `CUSTOM_AI_API_KEY` | opsional | API key provider custom (server lokal biasanya tidak butuh) |
+| `CUSTOM_AI_NAME` | opsional | Nama tombol di aplikasi, default `Custom` |
+| `CUSTOM_AI_MAX_TOKENS` | opsional | Batas token jawaban. Isi (misalnya `16000`) untuk model reasoning yang kehabisan token sebelum menjawab. |
+| `VIDEO_ENCODER` | opsional | `cpu` (default), `auto` (pakai encoder GPU yang berfungsi), atau nama encoder FFmpeg seperti `h264_nvenc`. |
+| `FFMPEG_STALL_SECONDS` | opsional | Watchdog: FFmpeg dihentikan kalau tidak bergerak selama ini, default `120` |
 | `OLLAMA_URL` | opsional | Default `http://127.0.0.1:11434` |
 | `OLLAMA_MODEL` | opsional | Model Ollama default |
 | `CLIPPER_SERVER_PORT` | opsional | Port backend, default `3030` |
@@ -172,7 +181,10 @@ vite.config.js                   proxy /api dan /outputs ke backend
 | "tidak ada wajah, crop tengah" | Tidak ada wajah terdeteksi (misalnya subjek membelakangi kamera atau terlalu jauh). Coba mode **Utuh + blur**. |
 | Error filter FFmpeg | Pakai build FFmpeg lengkap yang mendukung libass dan libfreetype. |
 | Tombol Ollama nonaktif | Ollama belum jalan (`ollama serve`) atau belum ada model (`ollama pull …`). |
-| OpenRouter error 401/429 | Key salah atau terkena rate limit. Cek `OPENROUTER_API_KEY` di `.env`. |
+| "... menolak API key (401)" | Key salah. Cek key provider itu di `.env`. |
+| "... kena rate limit (429)" | Sudah dicoba ulang otomatis. Tunggu sebentar, atau ganti model. |
+| "... berhenti di batas token" | Untuk model reasoning, isi `CUSTOM_AI_MAX_TOKENS`. Untuk server lokal dengan konteks kecil (Ollama lewat mode Custom memakai 4096 token), pakai mode Ollama, atau naikkan context length di server model. |
+| "FFmpeg tidak bergerak ... dan dihentikan" | Input video bermasalah atau driver GPU macet. Coba lagi; kalau memakai `VIDEO_ENCODER` GPU, kembali ke `cpu`. |
 | Vite: *Cannot find native binding* | `node_modules` dipasang di OS lain. Hapus `node_modules` lalu jalankan `npm install` lagi. |
 
 ## Penyimpanan
