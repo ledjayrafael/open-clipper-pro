@@ -14,13 +14,21 @@ const scoreClass = (score) =>
   score >= 50 ? 'bg-yellow-500/20 text-yellow-400' :
   'bg-red-500/20 text-red-400';
 
+// How a landscape source becomes 9:16.
+const REFRAME_OPTIONS = [
+  { id: 'track', label: 'Ikuti wajah', hint: 'Crop bergerak mengikuti wajah utama' },
+  { id: 'center', label: 'Crop tengah', hint: 'Potong bagian tengah, paling cepat' },
+  { id: 'blur', label: 'Utuh + blur', hint: 'Seluruh frame, latar diisi versi blur' },
+  { id: 'black', label: 'Utuh + hitam', hint: 'Seluruh frame dengan bar hitam' },
+];
+
 const inputClass = 'w-full bg-slate-900 border border-slate-800 rounded-lg px-2.5 py-1.5 text-xs font-bold text-slate-200 focus:outline-none focus:border-indigo-500 disabled:opacity-50';
 
 // Step 3b: the AI's candidates, editable before anything is rendered.
 export default function HighlightReview({
   drafts, setDrafts, duration, analysis, fmt, busy, progress,
   onPreview, onRender, onReanalyze,
-  hookEnabled, setHookEnabled, faceDetection, setFaceDetection,
+  hookEnabled, setHookEnabled, reframeMode, setReframeMode,
   direction, setDirection,
 }) {
   const update = (id, patch) => setDrafts(prev => prev.map(d => (d.id === id ? { ...d, ...patch } : d)));
@@ -143,16 +151,31 @@ export default function HighlightReview({
         })}
       </ul>
 
-      <div className="mt-6 grid grid-cols-1 sm:grid-cols-2 gap-3">
-        <label className="flex items-center gap-3 text-sm font-black text-slate-300">
-          <input type="checkbox" checked={hookEnabled} disabled={busy} onChange={e => setHookEnabled(e.target.checked)} className="w-4 h-4 accent-indigo-500" />
-          Hook text di 4 detik pertama
-        </label>
-        <label className="flex items-center gap-3 text-sm font-black text-slate-300">
-          <input type="checkbox" checked={faceDetection} disabled={busy} onChange={e => setFaceDetection(e.target.checked)} className="w-4 h-4 accent-indigo-500" />
-          Auto Face Detection
-        </label>
+      <div className="mt-6">
+        <p className="text-[10px] font-black uppercase tracking-widest text-slate-500 mb-1">Reframe 9:16</p>
+        <div role="radiogroup" aria-label="Reframe 9:16" className="grid grid-cols-2 sm:grid-cols-4 gap-1 p-1 bg-slate-900/60 border border-slate-800 rounded-xl">
+          {REFRAME_OPTIONS.map(opt => (
+            <button
+              key={opt.id}
+              type="button"
+              role="radio"
+              aria-checked={reframeMode === opt.id}
+              title={opt.hint}
+              disabled={busy}
+              onClick={() => setReframeMode(opt.id)}
+              className={`py-2 px-2 rounded-lg text-[11px] font-black transition-colors disabled:opacity-40 ${reframeMode === opt.id ? 'bg-indigo-600 text-white' : 'text-slate-300 hover:bg-slate-800'}`}
+            >
+              {opt.label}
+            </button>
+          ))}
+        </div>
+        <p className="mt-1 text-[10px] text-slate-500">{REFRAME_OPTIONS.find(o => o.id === reframeMode)?.hint}</p>
       </div>
+
+      <label className="mt-4 flex items-center gap-3 text-sm font-black text-slate-300">
+        <input type="checkbox" checked={hookEnabled} disabled={busy} onChange={e => setHookEnabled(e.target.checked)} className="w-4 h-4 accent-indigo-500" />
+        Hook text di 4 detik pertama
+      </label>
 
       <button
         type="button"

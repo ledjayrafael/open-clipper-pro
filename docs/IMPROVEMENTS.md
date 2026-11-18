@@ -50,7 +50,9 @@ Yang **sudah lebih baik** di Open Clipper Pro dan perlu dipertahankan:
    - Sebar pilihan ke seluruh durasi video.
    - Jangan mengarang timestamp.
 
-### P1: kualitas output
+### P1: kualitas output (selesai)
+
+> Sudah dikerjakan: face tracking per frame lewat `server/face_track.py` (MediaPipe Tasks, EMA dan deadzone, deteksi pergantian kamera, tetap pada subjek dalam satu shot, dan crop dikirim ke FFmpeg lewat `sendcmd`), mode reframe crop tengah, utuh + blur, dan utuh + hitam, caption karaoke, serta padding ke jeda hening. Bonus pembicara aktif (gerak bibir) belum dikerjakan.
 
 4. **Face tracking per frame.**
    - Ganti crop statis dengan posisi per frame: sampling, misalnya, 5 fps, lalu haluskan dengan EMA (sekitar 0,15). Tambahkan deadzone 2% supaya tidak bergetar, dan snap langsung kalau lompatannya lebih dari 35% (ganti scene).

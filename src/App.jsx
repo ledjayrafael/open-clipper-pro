@@ -27,7 +27,8 @@ export default function App() {
   const [subtitleSize, setSubtitleSize] = useState(22);
   const [subtitleY, setSubtitleY] = useState(0);
   const [status, setStatus] = useState('idle');
-  const [faceDetection, setFaceDetection] = useState(true);
+  const [reframeMode, setReframeMode] = useState(() => readPref('clipper.reframe', 'track'));
+  const [karaoke, setKaraoke] = useState(() => readPref('clipper.karaoke', '1') === '1');
   const [ffmpegLoaded, setFfmpegLoaded] = useState(false);
   const [progress, setProgress] = useState({ step: '', detail: '', percent: 0 });
   const [exportedClips, setExportedClips] = useState([]);
@@ -72,6 +73,8 @@ export default function App() {
   useEffect(() => { writePref('clipper.clipCount', String(clipCount)); }, [clipCount]);
   useEffect(() => { writePref('clipper.clipLength', clipLength); }, [clipLength]);
   useEffect(() => { writePref('clipper.hook', hookEnabled ? '1' : '0'); }, [hookEnabled]);
+  useEffect(() => { writePref('clipper.reframe', reframeMode); }, [reframeMode]);
+  useEffect(() => { writePref('clipper.karaoke', karaoke ? '1' : '0'); }, [karaoke]);
 
   const aiLabel = aiProvider === 'ollama' ? `Ollama · ${ollamaModel || 'lokal'}` : 'OpenRouter';
 
@@ -268,7 +271,7 @@ export default function App() {
     setStatus('rendering');
     setProgress({ step: 'Render clip', detail: `Menyiapkan ${items.length} clip...`, percent: 0 });
     try {
-      const { jobId } = await postJson(`/api/sessions/${session.id}/render`, { items, faceDetection, hook: hookEnabled });
+      const { jobId } = await postJson(`/api/sessions/${session.id}/render`, { items, reframe: reframeMode, hook: hookEnabled });
       const result = await followJob(jobId, data => setProgress({ step: data.step, detail: data.detail, percent: data.percent }));
       applySession(result.session);
       setStatus('completed');
@@ -345,6 +348,7 @@ export default function App() {
         subtitleY: clip.clipSubY ?? subtitleY,
         clipDuration: clip.duration,
         sessionId: session?.id,
+        style: karaoke ? 'karaoke' : 'plain',
       });
       const result = await followJob(jobId, data => {
         setExportedClips(prev => prev.map((c, i) => i === clipIndex ? { ...c, subProgress: data.percent } : c));
@@ -637,8 +641,8 @@ export default function App() {
                 onReanalyze={startAnalysis}
                 hookEnabled={hookEnabled}
                 setHookEnabled={setHookEnabled}
-                faceDetection={faceDetection}
-                setFaceDetection={setFaceDetection}
+                reframeMode={reframeMode}
+                setReframeMode={setReframeMode}
                 direction={direction}
                 setDirection={setDirection}
               />
@@ -651,7 +655,11 @@ export default function App() {
                   <CheckCircle2 size={20} className="text-green-400" />
                   <h2 className="text-sm font-black uppercase tracking-widest text-green-400">{exportedClips.length} Clip Siap!</h2>
                 </div>
-                <p className="text-xs text-slate-500 mb-6">Preview clip tanpa subtitle. Klik "Generate Subtitle" untuk menambahkan teks, lalu unduh.</p>
+                <p className="text-xs text-slate-500 mb-3">Preview clip tanpa subtitle. Klik "Generate Subtitle" untuk menambahkan teks, lalu unduh.</p>
+                <label className="mb-6 flex items-center gap-3 text-sm font-black text-slate-300">
+                  <input type="checkbox" checked={karaoke} onChange={e => setKaraoke(e.target.checked)} className="w-4 h-4 accent-indigo-500" />
+                  Sorot kata yang sedang diucapkan (karaoke)
+                </label>
                 <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
                   {exportedClips.map((clip, idx) => (
                     <div key={clip.id} className="bg-black/60 border border-slate-800 rounded-2xl overflow-hidden flex flex-col">
@@ -685,6 +693,7 @@ export default function App() {
                             <p className="text-[10px] font-mono text-slate-500 mt-0.5">{fmt(clip.start)}–{fmt(clip.end)} · {Math.round(clip.duration)} dtk</p>
                           )}
                           {clip.reason && <p className="text-[11px] text-slate-400 mt-1.5 leading-snug">{clip.reason}</p>}
+                          {clip.reframeNote && <p className="text-[10px] text-slate-500 mt-1">Reframe: {clip.reframeNote}</p>}
                           <p className="text-[9px] text-slate-600 mt-1 truncate">{clip.filename}</p>
                         </div>
 

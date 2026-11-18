@@ -4,7 +4,8 @@ import fsp from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 import crypto from 'node:crypto';
-import { spawn, spawnSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
+import { pipeline } from 'node:stream';
 import Busboy from 'busboy';
 
 const PORT = Number(process.env.CLIPPER_SERVER_PORT || 3030);
@@ -371,17 +372,27 @@ const parseMomentsJson = (content) => {
 };
 
 // Move a cut onto word boundaries so clips never start or end mid-word.
+// Move a cut onto word boundaries so clips never start or end mid-word, then
+// pad into the surrounding silence (never into the neighbouring words) so the
+// first and last sentence are not clipped.
+const LEAD_IN = 0.6;
+const TAIL_OUT = 1.2;
+const SILENCE_GAP = 0.05;
 const snapToWords = (start, end, words, duration) => {
-  const firstWord = words.find(w => w.end > start);
-  let lastWord = null;
-  for (const w of words) {
-    if (w.start < end) lastWord = w;
+  const firstIndex = words.findIndex(w => w.end > start);
+  let lastIndex = -1;
+  for (let i = 0; i < words.length; i++) {
+    if (words[i].start < end) lastIndex = i;
     else break;
   }
-  if (!firstWord || !lastWord || lastWord.end <= firstWord.start) return { start, end };
+  if (firstIndex === -1 || lastIndex < firstIndex) return { start, end };
+  const first = words[firstIndex];
+  const last = words[lastIndex];
+  const previousEnd = firstIndex > 0 ? words[firstIndex - 1].end + SILENCE_GAP : 0;
+  const nextStart = lastIndex + 1 < words.length ? words[lastIndex + 1].start - SILENCE_GAP : duration;
   return {
-    start: Math.max(0, firstWord.start - 0.15),
-    end: Math.min(duration, lastWord.end + 0.3),
+    start: Math.max(0, Math.min(first.start, Math.max(first.start - LEAD_IN, previousEnd))),
+    end: Math.min(duration, Math.max(last.end, Math.min(last.end + TAIL_OUT, nextStart))),
   };
 };
 
@@ -662,7 +673,7 @@ const escapeAssText = (text) => String(text || '')
 // Generate an ASS subtitle file. Returns the file path.
 // subtitleY: 0 = bottom, 100 = top (user slider)
 // The ASS format handles word-wrapping automatically via PlayResX/MarginL/MarginR.
-const generateAssFile = async (captions, subtitleSize, subtitleY, outputAssPath, videoWidth = 1080, videoHeight = 1920) => {
+const subtitleAssHeader = (subtitleSize, subtitleY, videoWidth = 1080, videoHeight = 1920) => {
   const fontSize = Math.max(20, Math.round(Number(subtitleSize || 22) * 3));
   const outlineSize = Math.max(2, Math.round(fontSize / 14));
   const shadowSize = 1;
@@ -674,7 +685,7 @@ const generateAssFile = async (captions, subtitleSize, subtitleY, outputAssPath,
   // MarginV from bottom: 0% → small margin (40px), 100% → near top
   const marginV = Math.round(40 + yRatio * (videoHeight - fontSize * 2 - 80));
   
-  const assContent = `[Script Info]
+  return `[Script Info]
 Title: Subtitle
 ScriptType: v4.00+
 WrapStyle: 0
@@ -688,13 +699,52 @@ Style: Default,Arial,${fontSize},&H00FFFFFF,&H000000FF,&H00000000,&H80000000,-1,
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
-${captions.map(c => {
+`;
+};
+
+const generateAssFile = async (captions, subtitleSize, subtitleY, outputAssPath) => {
+  const events = captions.map(c => {
     const text = escapeAssText(c.text || '').toUpperCase();
     return `Dialogue: 0,${toAssTime(c.start_offset)},${toAssTime(c.end_offset)},Default,,0,0,0,,${text}`;
-  }).join('\n')}
-`;
+  });
+  await fsp.writeFile(outputAssPath, subtitleAssHeader(subtitleSize, subtitleY) + events.join('\n') + '\n', 'utf-8');
+  return outputAssPath;
+};
 
-  await fsp.writeFile(outputAssPath, assContent, 'utf-8');
+// Karaoke captions: short lines where the word being spoken is highlighted.
+// One event per word, each showing the whole line with that word in yellow.
+const KARAOKE_WORDS_PER_LINE = 3;
+const KARAOKE_LINE_GAP = 0.7; // a pause longer than this starts a new line
+const KARAOKE_HIGHLIGHT = '&H0000E5FF&'; // ASS colours are BGR: warm yellow
+const generateKaraokeAssFile = async (words, subtitleSize, subtitleY, outputAssPath) => {
+  const lines = [];
+  let line = [];
+  for (const w of words) {
+    const previous = line[line.length - 1];
+    if (line.length >= KARAOKE_WORDS_PER_LINE || (previous && w.start - previous.end > KARAOKE_LINE_GAP)) {
+      lines.push(line);
+      line = [];
+    }
+    line.push(w);
+  }
+  if (line.length) lines.push(line);
+
+  const events = [];
+  let previousEnd = 0;
+  lines.forEach((lineWords, lineIndex) => {
+    const nextLineStart = lines[lineIndex + 1]?.[0].start ?? Infinity;
+    const texts = lineWords.map(w => escapeAssText(w.word).toUpperCase());
+    lineWords.forEach((w, j) => {
+      const start = Math.max(w.start, previousEnd);
+      // Hold each state until the next word starts; hold the last word briefly.
+      const until = j + 1 < lineWords.length ? lineWords[j + 1].start : Math.min(w.end + 0.4, nextLineStart);
+      const end = Math.max(until, start + 0.08);
+      const text = texts.map((t, k) => (k === j ? `{\\c${KARAOKE_HIGHLIGHT}}${t}{\\c&HFFFFFF&}` : t)).join(' ');
+      events.push(`Dialogue: 0,${toAssTime(start)},${toAssTime(end)},Default,,0,0,0,,${text}`);
+      previousEnd = end;
+    });
+  });
+  await fsp.writeFile(outputAssPath, subtitleAssHeader(subtitleSize, subtitleY) + events.join('\n') + '\n', 'utf-8');
   return outputAssPath;
 };
 
@@ -1038,28 +1088,68 @@ const analyzeSession = async (session, settings, { transcribe }, progress, tempD
   return { session: publicSession(session) };
 };
 
-// Center crop, or a crop centred on the largest face in one sampled frame.
-const cropFilterFor = async (videoPath, tempDir, start, clipDuration, index) => {
-  let vf = 'crop=ih*(9/16):ih:(iw-ow)/2:0';
-  try {
-    const framePath = path.join(tempDir, `frame_${index}.jpg`);
-    const sampleSec = Math.max(0, Math.min(start + 1, start + Math.max(0.5, Math.floor(clipDuration / 2))));
-    await runCommand('ffmpeg', ['-y', '-ss', String(sampleSec), '-i', videoPath, '-vframes', '1', '-q:v', '2', framePath]);
-    const py = spawnSync('python', [path.join(ROOT_DIR, 'server', 'face_detect.py'), framePath], { encoding: 'utf8', maxBuffer: 10 * 1024 * 1024 });
-    const info = JSON.parse(String(py?.stdout || '').trim() || '{}');
-    if (info.face) {
-      const imgW = Number(info.width || 0);
-      const imgH = Number(info.height || 0);
-      const cropW = Math.round(imgH * (9 / 16));
-      if (imgW > cropW) {
-        const cropX = clamp(Math.round(info.face.cx - cropW / 2), 0, imgW - cropW);
-        vf = `crop=${cropW}:${imgH}:${cropX}:0`;
-      }
-    }
-  } catch {
-    // frame grab or Python failed: keep the center crop
+// ---------------------------------------------------------------------------
+// Reframing to 9:16
+// ---------------------------------------------------------------------------
+
+const PYTHON_BIN = process.env.PYTHON_BIN || 'python';
+const REFRAME_MODES = ['track', 'center', 'blur', 'black'];
+const CENTER_CROP = 'crop=ih*(9/16):ih:(iw-ow)/2:0';
+const ffmpegFilePath = (filePath) => filePath.replace(/\\/g, '/').replace(/:/g, '\\:');
+
+// Follow the main face through the clip. face_track.py returns one crop x per
+// frame; sendcmd feeds them to the crop filter as the clip plays.
+const faceTrackFilter = async (videoPath, start, clipDuration, tempDir, index) => {
+  const { stdout } = await runCommand(PYTHON_BIN, [
+    path.join(ROOT_DIR, 'server', 'face_track.py'), videoPath, String(start), String(clipDuration),
+  ]);
+  const track = JSON.parse(stdout.trim().split('\n').pop() || '{}');
+  if (track.error) throw new Error(track.error);
+  if (!track.x?.length || track.faces_found === 0) return { filter: CENTER_CROP, note: 'tidak ada wajah, crop tengah' };
+
+  const lines = [];
+  let previous = null;
+  track.x.forEach((x, frame) => {
+    if (x === previous) return;
+    lines.push(`${(frame / track.fps).toFixed(3)} crop x ${x};`);
+    previous = x;
+  });
+  const cmdPath = path.join(tempDir, `track_${index}.cmd`);
+  await fsp.writeFile(cmdPath, lines.join('\n') + '\n', 'utf-8');
+  return {
+    filter: `sendcmd=f='${ffmpegFilePath(cmdPath)}',crop=${track.crop_w}:${track.height}:${track.x[0]}:0`,
+    note: `${track.detector}, wajah di ${track.faces_found}/${track.samples} sampel`,
+  };
+};
+
+// Video filter for the chosen reframe mode. Tracking falls back to a center
+// crop when Python, OpenCV or MediaPipe is unavailable.
+const reframeFilter = async (mode, videoPath, start, clipDuration, tempDir, index) => {
+  if (mode === 'blur') {
+    // Blur a small copy for the background (much cheaper than blurring 1080x1920).
+    return {
+      filter: 'split=2[bg][fg];'
+        + '[bg]scale=270:480:force_original_aspect_ratio=increase,crop=270:480,boxblur=10:2,scale=1080:1920[bgb];'
+        + '[fg]scale=1080:1920:force_original_aspect_ratio=decrease:force_divisible_by=2[fgs];'
+        + '[bgb][fgs]overlay=(W-w)/2:(H-h)/2,setsar=1',
+      note: '',
+    };
   }
-  return vf;
+  if (mode === 'black') {
+    return {
+      filter: 'scale=1080:1920:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,setsar=1',
+      note: '',
+    };
+  }
+  if (mode === 'track') {
+    try {
+      return await faceTrackFilter(videoPath, start, clipDuration, tempDir, index);
+    } catch (error) {
+      console.error('Face tracking failed, using center crop:', error.message.slice(0, 300));
+      return { filter: CENTER_CROP, note: 'face tracking gagal, crop tengah' };
+    }
+  }
+  return { filter: CENTER_CROP, note: '' };
 };
 
 // Hook text: a boxed line near the top for the first seconds of the clip.
@@ -1086,7 +1176,6 @@ Dialogue: 0,${toAssTime(0)},${toAssTime(end)},Hook,,0,0,0,,{\\fad(120,250)}${esc
   await fsp.writeFile(assPath, content, 'utf-8');
 };
 
-const assFilterPath = (assPath) => assPath.replace(/\\/g, '/').replace(/:/g, '\\:');
 
 // Phase 3: render the spans the user picked (with their edits).
 const renderSession = async (session, items, options, progress, tempDir) => {
@@ -1105,13 +1194,13 @@ const renderSession = async (session, items, options, progress, tempDir) => {
 
     const outputFile = `plain_${sanitizeName(title)}_${i + 1}_${Date.now()}.mp4`;
     const outputPath = path.join(OUTPUT_DIR, outputFile);
-    let vf = options.faceDetection
-      ? await cropFilterFor(videoPath, tempDir, start, clipDuration, i)
-      : 'crop=ih*(9/16):ih:(iw-ow)/2:0';
+    progress(step, options.reframe === 'track' ? 'Melacak wajah...' : 'Memotong clip...', Math.round((i / items.length) * 98));
+    const reframe = await reframeFilter(options.reframe, videoPath, start, clipDuration, tempDir, i);
+    let vf = reframe.filter;
     if (hookText) {
       const assPath = path.join(tempDir, `hook_${i}.ass`);
       await writeHookAss(hookText, assPath, clipDuration);
-      vf += `,ass='${assFilterPath(assPath)}'`;
+      vf += `,ass='${ffmpegFilePath(assPath)}'`;
     }
 
     await runCommandWithProgress('ffmpeg', [
@@ -1133,6 +1222,8 @@ const renderSession = async (session, items, options, progress, tempDir) => {
       id: `${Date.now().toString(36)}${i}`,
       candidateId: candidate?.id ?? null,
       title, hookText,
+      reframe: options.reframe,
+      reframeNote: reframe.note,
       reason: candidate?.reason || '',
       viralScore: candidate?.viralScore ?? null,
       start, end, duration: clipDuration,
@@ -1216,6 +1307,8 @@ const readJsonBody = (req, limit = 1024 * 1024) => new Promise((resolve, reject)
 const VIDEO_TYPES = { '.mp4': 'video/mp4', '.m4v': 'video/mp4', '.mov': 'video/quicktime', '.webm': 'video/webm', '.mkv': 'video/x-matroska', '.avi': 'video/x-msvideo' };
 
 // Serve a file with HTTP Range support, which <video> needs for seeking.
+// pipeline() closes the file when the browser aborts a request (it does that
+// constantly while seeking); a bare pipe() would keep the handle open.
 const streamFile = async (req, res, filePath) => {
   const { size } = await fsp.stat(filePath);
   const type = VIDEO_TYPES[path.extname(filePath).toLowerCase()] || 'application/octet-stream';
@@ -1232,20 +1325,21 @@ const streamFile = async (req, res, filePath) => {
       'Content-Type': type, 'Accept-Ranges': 'bytes',
       'Content-Range': `bytes ${start}-${end}/${size}`, 'Content-Length': end - start + 1,
     });
-    fs.createReadStream(filePath, { start, end }).pipe(res);
+    pipeline(fs.createReadStream(filePath, { start, end }), res, () => {});
     return;
   }
   res.writeHead(200, { 'Content-Type': type, 'Accept-Ranges': 'bytes', 'Content-Length': size });
-  fs.createReadStream(filePath).pipe(res);
+  pipeline(fs.createReadStream(filePath), res, () => {});
 };
 
-const addSubtitleJob = async (jobId, inputPath, captions, subtitleSize, subtitleY, clipDuration, onSuccess) => {
+const addSubtitleJob = async (jobId, inputPath, captions, subtitleSize, subtitleY, clipDuration, onSuccess, style = 'karaoke') => {
   let assPath = null;
   try {
     // Step 1: Transcribe actual audio if Groq API key is available
     let finalCaptions = captions;
     const storedWords = await fsp.readFile(wordsFileFor(inputPath), 'utf-8').then(JSON.parse).catch(() => null);
-    if (Array.isArray(storedWords) && storedWords.length) {
+    const hasWords = Array.isArray(storedWords) && storedWords.length > 0;
+    if (hasWords) {
       finalCaptions = wordsToCaptions(storedWords);
     } else if (GROQ_API_KEY) {
       sendSseEvent(jobId, 'progress', { step: 'Transkripsi audio...', detail: 'Mengenali kata-kata dalam audio...', percent: 5 });
@@ -1276,7 +1370,9 @@ const addSubtitleJob = async (jobId, inputPath, captions, subtitleSize, subtitle
     // Step 3: Generate ASS subtitle file
     sendSseEvent(jobId, 'progress', { step: 'Membuat file subtitle...', detail: '', percent: 10 });
     assPath = inputPath + `.sub_${Date.now()}.ass`;
-    await generateAssFile(timedCaptions, subtitleSize, subtitleY, assPath);
+    // Karaoke needs real word timing; AI-written captions fall back to plain lines.
+    if (style === 'karaoke' && hasWords) await generateKaraokeAssFile(storedWords, subtitleSize, subtitleY, assPath);
+    else await generateAssFile(timedCaptions, subtitleSize, subtitleY, assPath);
 
     const baseName = path.parse(inputPath).name.replace(/^plain_/, 'sub_');
     const outputFile = `${baseName}_${Date.now()}.mp4`;
@@ -1379,7 +1475,7 @@ const server = http.createServer(async (req, res) => {
       'Content-Disposition': `attachment; filename="${safeName}"`,
       'Access-Control-Allow-Origin': '*',
     });
-    fs.createReadStream(filePath).pipe(res);
+    pipeline(fs.createReadStream(filePath), res, () => {});
     return;
   }
 
@@ -1463,7 +1559,8 @@ const server = http.createServer(async (req, res) => {
       } else if (req.method === 'POST' && action === 'render') {
         const body = await readJsonBody(req);
         const items = readRenderItems(session, body);
-        const options = { faceDetection: body.faceDetection !== false, hook: body.hook === true };
+        const reframe = REFRAME_MODES.includes(body.reframe) ? body.reframe : (body.faceDetection === false ? 'center' : 'track');
+        const options = { reframe, hook: body.hook === true };
         const jobId = startSessionJob(session, 'render', (progress, tempDir) =>
           renderSession(session, items, options, progress, tempDir));
         sendJson(res, 200, { ok: true, jobId });
@@ -1481,7 +1578,7 @@ const server = http.createServer(async (req, res) => {
     req.on('data', chunk => { body += chunk.toString(); });
     req.on('end', async () => {
       try {
-        const { clipFilename, captions, subtitleSize, subtitleY, clipDuration, sessionId } = JSON.parse(body);
+        const { clipFilename, captions, subtitleSize, subtitleY, clipDuration, sessionId, style } = JSON.parse(body);
         const safeName = path.basename(clipFilename);
         const inputPath = path.join(OUTPUT_DIR, safeName);
         if (!(await fileExists(inputPath))) {
@@ -1499,7 +1596,7 @@ const server = http.createServer(async (req, res) => {
           clip.subtitledUrl = result.url;
           await saveSession(session);
         } : undefined;
-        addSubtitleJob(jobId, inputPath, captions || [], subtitleSize || 22, subtitleY ?? 0, clipDuration || 30, recordInSession);
+        addSubtitleJob(jobId, inputPath, captions || [], subtitleSize || 22, subtitleY ?? 0, clipDuration || 30, recordInSession, style === 'plain' ? 'plain' : 'karaoke');
         sendJson(res, 200, { ok: true, jobId });
       } catch (error) {
         sendJson(res, 400, { ok: false, error: error.message || 'Invalid request.' });

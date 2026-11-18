@@ -32,3 +32,6 @@ dist-ssr
 local-exports/
 .venv/
 .venv-1/
+
+# Downloaded face detection model
+server/models/

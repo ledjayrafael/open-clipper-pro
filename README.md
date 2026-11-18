@@ -33,10 +33,13 @@
   - **OpenRouter** (cloud, default model Gemini Flash Lite).
   - **Ollama** (lokal, tanpa API key, misalnya `gemma4:e4b`).
 - **Potong 9:16 dengan FFmpeg** langsung di mesin kamu.
-- **Crop mengikuti wajah** dengan MediaPipe (offline), jadi subjek tetap di tengah frame.
+- **Reframe 9:16** dengan empat pilihan:
+  - **Ikuti wajah:** crop bergerak halus mengikuti wajah utama (MediaPipe), langsung pindah saat kamera berganti, dan tidak bolak-balik antar orang dalam satu shot.
+  - **Crop tengah**, **Utuh + blur** (seluruh frame dengan latar blur), dan **Utuh + hitam**.
+- **Potongan rapi.** Awal dan akhir clip digeser ke batas kata lalu diberi jeda sampai keheningan terdekat, jadi kalimat tidak terpotong.
 - **Subtitle otomatis.**
   - Audio ditranskripsi dengan Groq Whisper (`whisper-large-v3-turbo`, bahasa Indonesia).
-  - Teksnya di-*burn* ke video sebagai subtitle ASS.
+  - Teksnya di-*burn* ke video sebagai subtitle ASS, dengan gaya karaoke: kata yang sedang diucapkan disorot kuning (bisa dimatikan).
   - Ukuran dan posisi vertikalnya bisa diatur per clip.
 - **Progres real-time** lewat Server-Sent Events.
 - **API key aman.** Semua key hanya ada di backend (`.env`), tidak pernah dikirim ke browser.
@@ -52,7 +55,7 @@ Klik "Cari Highlight Viral" ────────▶ POST /api/sessions (uplo
                                       └─ validasi: batas kata, durasi, overlap, rentang yang diminta
 Pilih + edit highlight ─────────────▶ POST /api/sessions/:id/render
                                       ├─ FFmpeg: potong segmen + crop 9:16 + hook text
-                                      └─ MediaPipe: cari posisi wajah
+                                      └─ face_track.py: jalur crop per frame (MediaPipe)
 Generate Subtitle ──────────────────▶ word timing tersimpan ──▶ ASS ──▶ FFmpeg burn-in
 (semua progres dikirim lewat SSE)
 Simpan Video ◀────────────────────── /outputs/*.mp4
@@ -65,7 +68,7 @@ Simpan Video ◀─────────────────────�
 | Kebutuhan | Versi | Cek |
 |---|---|---|
 | Node.js | 20+ (dikembangkan di 24) | `node --version` |
-| Python | 3.10 / 3.11, 64-bit | `python --version` |
+| Python | 3.10–3.13, 64-bit | `python --version` |
 | FFmpeg | build lengkap (libass, libfreetype) | `ffmpeg -version` |
 | Ollama *(opsional)* | terbaru | `ollama --version` |
 
@@ -84,6 +87,10 @@ python -m venv .venv
 source .venv/bin/activate        # Windows: .\.venv\Scripts\Activate.ps1
 pip install -r server/requirements.txt
 ```
+
+Saat face tracking pertama kali dipakai, model deteksi wajah `blaze_face_short_range.tflite` (sekitar 230 KB) diunduh dari storage resmi MediaPipe ke `server/models/`. Kalau unduhan gagal atau MediaPipe tidak ada, tracking memakai Haar cascade bawaan OpenCV (kurang akurat). Kalau OpenCV juga tidak ada, clip memakai crop tengah.
+
+Kalau server tidak memakai Python dari venv ini, set `PYTHON_BIN` di `.env` (lihat Konfigurasi).
 
 Kalau `mediapipe` gagal dipasang di Windows, pakai conda:
 
@@ -107,6 +114,7 @@ Salin `.env.example` menjadi `.env` di root project, lalu isi:
 | `OLLAMA_URL` | opsional | Default `http://127.0.0.1:11434` |
 | `OLLAMA_MODEL` | opsional | Model Ollama default |
 | `CLIPPER_SERVER_PORT` | opsional | Port backend, default `3030` |
+| `PYTHON_BIN` | opsional | Interpreter Python untuk face tracking, default `python`. Arahkan ke venv, misalnya `.venv/bin/python` atau `.venv\Scripts\python.exe`. |
 
 `.env` sudah di-*gitignore*. Jangan taruh key di `src/`, karena semua yang ada di sana ikut terkirim ke browser.
 
@@ -146,7 +154,7 @@ Lalu buka <http://localhost:5173>.
 
 ```
 server/local-ffmpeg-server.mjs   backend: potong clip, subtitle, AI, SSE
-server/face_detect.py            helper deteksi wajah MediaPipe
+server/face_track.py             face tracking: jalur crop 9:16 per frame
 server/requirements.txt          dependensi Python
 src/App.jsx                      UI React (alur utama)
 src/components/HighlightReview.jsx  daftar highlight yang bisa diedit
@@ -160,7 +168,8 @@ vite.config.js                   proxy /api dan /outputs ke backend
 | Masalah | Solusi |
 |---|---|
 | "Server FFmpeg lokal belum aktif" | Jalankan `npm run dev:server`. |
-| Crop wajah tidak jalan | Pastikan `python` di PATH adalah interpreter venv yang sudah memasang `server/requirements.txt`. |
+| Kartu clip menulis "face tracking gagal, crop tengah" | Python yang dipakai server belum punya OpenCV/MediaPipe. Pasang `server/requirements.txt`, atau set `PYTHON_BIN` di `.env` ke interpreter venv-nya. |
+| "tidak ada wajah, crop tengah" | Tidak ada wajah terdeteksi (misalnya subjek membelakangi kamera atau terlalu jauh). Coba mode **Utuh + blur**. |
 | Error filter FFmpeg | Pakai build FFmpeg lengkap yang mendukung libass dan libfreetype. |
 | Tombol Ollama nonaktif | Ollama belum jalan (`ollama serve`) atau belum ada model (`ollama pull …`). |
 | OpenRouter error 401/429 | Key salah atau terkena rate limit. Cek `OPENROUTER_API_KEY` di `.env`. |
