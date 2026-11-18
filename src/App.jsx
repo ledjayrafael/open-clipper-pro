@@ -5,7 +5,21 @@ import {
   Volume2, VolumeX, Type, MoveVertical, Save, TrendingUp
 } from 'lucide-react';
 
-const OPENROUTER_API_KEY = "REMOVED_OPENROUTER_KEY";
+const readPref = (key, fallback) => {
+  try { return localStorage.getItem(key) || fallback; } catch { return fallback; }
+};
+const writePref = (key, value) => {
+  try { if (value) localStorage.setItem(key, value); } catch { /* storage unavailable */ }
+};
+
+// Small local models sometimes wrap JSON in prose or ``` fences.
+const parseAiJson = (text) => {
+  const raw = String(text || '');
+  const start = raw.indexOf('{');
+  const end = raw.lastIndexOf('}');
+  if (start === -1 || end <= start) throw new Error('Jawaban AI bukan JSON yang valid.');
+  return JSON.parse(raw.slice(start, end + 1));
+};
 
 export default function App() {
   const [videoFile, setVideoFile] = useState(null);
@@ -13,6 +27,7 @@ export default function App() {
   const [subtitleSize, setSubtitleSize] = useState(22);
   const [subtitleY, setSubtitleY] = useState(0);
   const [status, setStatus] = useState('idle');
+  const [faceDetection, setFaceDetection] = useState(true);
   const [ffmpegLoaded, setFfmpegLoaded] = useState(false);
   const [progress, setProgress] = useState({ step: '', detail: '', percent: 0 });
   const [exportedClips, setExportedClips] = useState([]);
@@ -21,8 +36,33 @@ export default function App() {
   const [isPlaying, setIsPlaying] = useState(false);
   const [isMuted, setIsMuted] = useState(false);
   const [engineMode, setEngineMode] = useState('checking');
+  const [aiProviders, setAiProviders] = useState(null);
+  const [aiProvider, setAiProvider] = useState(() => readPref('clipper.aiProvider', ''));
+  const [ollamaModel, setOllamaModel] = useState(() => readPref('clipper.ollamaModel', ''));
 
   const videoRef = useRef(null);
+
+  // AI providers (OpenRouter / Ollama) available on the backend
+  useEffect(() => {
+    fetch('/api/ai-providers')
+      .then(r => (r.ok ? r.json() : null))
+      .then(data => {
+        if (!data?.ok) return;
+        setAiProviders(data);
+        setAiProvider(prev => {
+          if (prev && data[prev]?.available) return prev;
+          if (data[data.default]?.available) return data.default;
+          return data.openrouter.available ? 'openrouter' : data.ollama.available ? 'ollama' : (prev || data.default);
+        });
+        setOllamaModel(prev => (data.ollama.models.includes(prev) ? prev : data.ollama.defaultModel));
+      })
+      .catch(() => {});
+  }, []);
+
+  useEffect(() => { writePref('clipper.aiProvider', aiProvider); }, [aiProvider]);
+  useEffect(() => { writePref('clipper.ollamaModel', ollamaModel); }, [ollamaModel]);
+
+  const aiLabel = aiProvider === 'ollama' ? `Ollama · ${ollamaModel || 'lokal'}` : 'OpenRouter';
 
   // 1. Detect backend local FFmpeg server
   useEffect(() => {
@@ -112,7 +152,7 @@ export default function App() {
 
     try {
       // Step A: AI Analysis
-      setProgress({ step: 'Analisis AI', detail: 'Mendeteksi segmen viral (3-10 clip)...', percent: 5 });
+      setProgress({ step: `Analisis AI (${aiLabel})`, detail: 'Mendeteksi segmen viral (3-10 clip)...', percent: 5 });
       const duration = videoDuration || 60;
 
       const prompt = `Anda adalah ahli editor video viral profesional.
@@ -129,25 +169,24 @@ ATURAN:
 Format JSON MURNI:
 {"moments":[{"id":1,"start":0,"end":20,"title":"Hook Awal","viral_score":85,"captions":[{"text":"INI DIA RAHASIANYA","start_offset":0,"end_offset":4},{"text":"WAJIB NONTON SAMPAI HABIS","start_offset":4,"end_offset":8}]}]}`;
 
-      const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+      // The backend holds the OpenRouter key; the browser never sees it.
+      const response = await fetch('/api/analyze', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
-        },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          model: "google/gemini-3.1-flash-lite-preview",
-          messages: [
-            { role: "system", content: prompt },
-            { role: "user", content: `Analisis video "${videoFile.name}" (durasi: ${Math.round(duration)}s). Temukan 3-10 segmen paling viral dengan skor viralnya.` }
-          ],
-          response_format: { type: "json_object" }
-        })
+          systemPrompt: prompt,
+          userPrompt: `Analisis video "${videoFile.name}" (durasi: ${Math.round(duration)}s). Temukan 3-10 segmen paling viral dengan skor viralnya.`,
+          provider: aiProvider || undefined,
+          model: aiProvider === 'ollama' ? ollamaModel || undefined : undefined,
+        }),
       });
 
-      if (!response.ok) throw new Error(`API Error: ${response.status}`);
-      const result = await response.json();
-      const content = JSON.parse(result.choices[0].message.content);
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok || !result.ok) throw new Error(result.error || `API Error: ${response.status}`);
+      const content = parseAiJson(result.content);
+      if (!Array.isArray(content.moments) || content.moments.length === 0) {
+        throw new Error(`AI (${aiLabel}) tidak mengembalikan segmen. Coba lagi atau ganti model.`);
+      }
 
       // Normalize moments & distribute captions evenly
       let moments = content.moments.map((m, idx) => {
@@ -180,6 +219,7 @@ Format JSON MURNI:
       setProgress({ step: 'Ekspor lokal', detail: 'Memotong clip tanpa subtitle...', percent: 20 });
       const formData = new FormData();
       formData.append('video', videoFile);
+      formData.append('face_detection', faceDetection ? '1' : '0');
       formData.append('moments', JSON.stringify(moments));
 
       const processResponse = await fetch('/api/process', {
@@ -383,15 +423,6 @@ Format JSON MURNI:
                     <video src={videoSrc} className="absolute inset-0 h-full w-full object-cover opacity-15 blur-2xl scale-125" muted loop autoPlay />
                     <video ref={videoRef} src={videoSrc} muted={isMuted} className="absolute inset-0 h-full w-full object-cover" />
 
-                    {/* Sample subtitle preview */}
-                    <div className="absolute z-20 pointer-events-none" style={{ left: '50%', transform: 'translateX(-50%)', bottom: `calc(10px + ${subtitleY}%)` }}>
-                      <span
-                        className="text-white font-black px-3 py-1.5 bg-black/60 rounded-lg inline-block leading-tight whitespace-nowrap"
-                        style={{ fontSize: `${subtitleSize}px`, textShadow: '0 2px 4px rgba(0,0,0,1)' }}
-                      >
-                        PREVIEW SUBTITLE
-                      </span>
-                    </div>
 
                     {/* Play/Pause overlay */}
                     <div className={`absolute inset-0 z-10 flex items-center justify-center transition-opacity duration-300 ${isPlaying ? 'opacity-0 group-hover:opacity-100' : 'opacity-100 bg-black/30'}`}>
@@ -415,20 +446,7 @@ Format JSON MURNI:
                   </div>
                 </div>
 
-                {/* Subtitle Size Slider */}
-                <div className="mt-5 max-w-[400px] mx-auto flex items-center gap-4">
-                  <Type size={14} className="text-slate-500 shrink-0" />
-                  <span className="text-[9px] font-black uppercase tracking-widest text-slate-500 shrink-0">Ukuran Subtitle</span>
-                  <input type="range" min={12} max={36} value={subtitleSize} onChange={e => setSubtitleSize(Number(e.target.value))} className="flex-1 accent-indigo-500 cursor-pointer" />
-                  <span className="text-[10px] font-bold text-indigo-400 w-5 text-right">{subtitleSize}</span>
-                </div>
-                {/* Subtitle Y Position Slider */}
-                <div className="mt-3 max-w-[400px] mx-auto flex items-center gap-4">
-                  <MoveVertical size={14} className="text-slate-500 shrink-0" />
-                  <span className="text-[9px] font-black uppercase tracking-widest text-slate-500 shrink-0">Posisi Vertikal</span>
-                  <input type="range" min={0} max={100} value={subtitleY} onChange={e => setSubtitleY(Number(e.target.value))} className="flex-1 accent-indigo-500 cursor-pointer" />
-                  <span className="text-[10px] font-bold text-indigo-400 w-8 text-right">{subtitleY}%</span>
-                </div>
+                {/* Subtitle preview removed before processing; per-clip subtitle controls remain in STEP 4 */}
               </div>
             )}
 
@@ -438,6 +456,56 @@ Format JSON MURNI:
                 <div className="flex items-center gap-3 mb-6">
                   <span className="bg-indigo-600 text-white text-[10px] font-black w-6 h-6 flex items-center justify-center rounded-full">3</span>
                   <h2 className="text-sm font-black uppercase tracking-widest">Proses</h2>
+                </div>
+
+                <div className="mb-5">
+                  <p className="text-[10px] font-black uppercase tracking-widest text-slate-500 mb-2">Mode AI</p>
+                  <div role="radiogroup" aria-label="Mode AI" className="grid grid-cols-2 gap-2 p-1 bg-slate-900/60 border border-slate-800 rounded-xl">
+                    {[
+                      { id: 'openrouter', label: 'OpenRouter', hint: 'Cloud', off: 'Key belum diset' },
+                      { id: 'ollama', label: 'Ollama', hint: 'Lokal', off: aiProviders?.ollama.running ? 'Belum ada model' : 'Tidak terdeteksi' },
+                    ].map(opt => {
+                      const available = aiProviders ? aiProviders[opt.id].available : true;
+                      const active = aiProvider === opt.id;
+                      return (
+                        <button
+                          key={opt.id}
+                          type="button"
+                          role="radio"
+                          aria-checked={active}
+                          disabled={!available || status === 'processing'}
+                          onClick={() => setAiProvider(opt.id)}
+                          title={available ? undefined : opt.off}
+                          className={`py-2.5 px-3 rounded-lg text-left transition-colors disabled:opacity-40 disabled:cursor-not-allowed ${active ? 'bg-indigo-600 text-white' : 'text-slate-300 hover:bg-slate-800'}`}
+                        >
+                          <span className="block text-xs font-black">{opt.label}</span>
+                          <span className={`block text-[10px] font-bold ${active ? 'text-indigo-200' : 'text-slate-500'}`}>
+                            {available ? opt.hint : opt.off}
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                  {aiProvider === 'ollama' && aiProviders?.ollama.models.length > 0 && (
+                    <div className="mt-3">
+                      <label htmlFor="ollama-model" className="block text-[10px] font-black uppercase tracking-widest text-slate-500 mb-1">Model lokal</label>
+                      <select
+                        id="ollama-model"
+                        value={ollamaModel}
+                        onChange={e => setOllamaModel(e.target.value)}
+                        disabled={status === 'processing'}
+                        className="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-sm font-bold text-slate-200 focus:outline-none focus:border-indigo-500"
+                      >
+                        {aiProviders.ollama.models.map(m => <option key={m} value={m}>{m}</option>)}
+                      </select>
+                      <p className="mt-1 text-[10px] text-slate-500">Model lokal lebih lambat; analisis bisa makan 1–3 menit.</p>
+                    </div>
+                  )}
+                </div>
+
+                <div className="flex items-center gap-3 mb-4">
+                  <input id="face-detect-toggle" type="checkbox" checked={faceDetection} onChange={e => setFaceDetection(e.target.checked)} className="w-4 h-4 accent-indigo-500" />
+                  <label htmlFor="face-detect-toggle" className="text-sm font-black text-slate-300">Auto Face Detection</label>
                 </div>
 
                 <button

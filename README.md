@@ -54,14 +54,22 @@ conda install -c conda-forge mediapipe opencv -y
 ```
 
 Configure API keys
-- OpenRouter (Gemini) — set `OPENROUTER_API_KEY` in `src/App.jsx` or export as env var.
-- Groq Whisper — set `GROQ_API_KEY` as environment variable (recommended).
+Keys live only on the backend. Copy `.env.example` to `.env` in the repo root and fill in:
+- `OPENROUTER_API_KEY` — used by the server's `/api/analyze` endpoint (the browser never sees it).
+- `GROQ_API_KEY` — Groq Whisper transcription (optional; without it, AI captions are used).
 
-PowerShell example (temporary for session):
-```powershell
-$env:OPENROUTER_API_KEY="sk-or-..."
-$env:GROQ_API_KEY="gsk_..."
+`.env` is gitignored. Never put keys in `src/` — anything there is shipped to the browser.
+Real environment variables also work and take precedence over `.env`.
+
+AI mode: OpenRouter or Ollama (local)
+- The **Proses** card has a **Mode AI** switch: OpenRouter (cloud, needs `OPENROUTER_API_KEY`) or Ollama (local, no key needed).
+- For Ollama: install it, pull a model, and keep it running:
+```bash
+ollama pull gemma4:e4b
+ollama serve
 ```
+- The model dropdown lists whatever is installed in Ollama. Local models are slower (analysis can take 1–3 minutes).
+- Optional `.env`: `AI_PROVIDER` (default mode), `OLLAMA_URL`, `OLLAMA_MODEL`.
 
 Run backend server (local FFmpeg server + face detection)
 - Start server from repo root (ensure Python venv activated so `python` invokes the MediaPipe-enabled interpreter):
@@ -125,3 +133,9 @@ Generated on April 11, 2026
 4. Frontend minta AI mendeteksi 5 segmen viral
 5. Backend lokal memanggil `ffmpeg` sistem untuk membuat 5 file MP4 dengan subtitle burn-in
 6. Hasil otomatis tersedia untuk diunduh
+
+## CARA RUN JIKA SEMUANYA SUDAH READY
+- masuk ke folder project melalui terminal
+- npm run dev
+- buka terminal baru dan jalankan npm run dev:server
+- buka http://localhost:5173

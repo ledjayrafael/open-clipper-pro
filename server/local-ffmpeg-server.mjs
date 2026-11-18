@@ -15,8 +15,104 @@ const FONT_PATHS = [
   'C:/Windows/Fonts/calibrib.ttf',
 ];
 
-// Groq Whisper API key (free: https://console.groq.com/keys)
-const GROQ_API_KEY = process.env.GROQ_API_KEY || 'REMOVED_GROQ_KEY';
+// API keys come from the environment or a gitignored .env file in the project root.
+try {
+  process.loadEnvFile(path.join(ROOT_DIR, '.env'));
+} catch {
+  // no .env file: rely on real environment variables
+}
+const GROQ_API_KEY = process.env.GROQ_API_KEY || '';
+const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || '';
+const OPENROUTER_MODEL = process.env.OPENROUTER_MODEL || 'google/gemini-3.1-flash-lite-preview';
+const OLLAMA_URL = (process.env.OLLAMA_URL || 'http://127.0.0.1:11434').replace(/\/+$/, '');
+const OLLAMA_MODEL = process.env.OLLAMA_MODEL || '';
+const AI_PROVIDER = process.env.AI_PROVIDER === 'ollama' ? 'ollama' : 'openrouter';
+if (!OPENROUTER_API_KEY) console.warn('OPENROUTER_API_KEY belum diset (lihat .env.example). Mode OpenRouter tidak tersedia; mode Ollama tetap bisa dipakai.');
+if (!GROQ_API_KEY) console.warn('GROQ_API_KEY belum diset. Subtitle memakai caption AI, bukan transkripsi.');
+
+const httpError = (statusCode, message) => Object.assign(new Error(message), { statusCode });
+
+// Returns installed Ollama model names, or null when Ollama is unreachable.
+async function listOllamaModels() {
+  try {
+    const response = await fetch(`${OLLAMA_URL}/api/tags`, { signal: AbortSignal.timeout(2000) });
+    if (!response.ok) return null;
+    const data = await response.json();
+    return (data.models || []).map(m => m.name).filter(Boolean);
+  } catch {
+    return null;
+  }
+}
+
+async function callOpenRouter(messages) {
+  if (!OPENROUTER_API_KEY) throw httpError(500, 'OPENROUTER_API_KEY belum diset di .env server. Pakai mode Ollama atau isi key-nya.');
+  const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${OPENROUTER_API_KEY}` },
+    body: JSON.stringify({ model: OPENROUTER_MODEL, messages, response_format: { type: 'json_object' } }),
+  });
+  if (!response.ok) {
+    const errText = await response.text().catch(() => '');
+    throw httpError(502, `OpenRouter error ${response.status}: ${errText.slice(0, 300)}`);
+  }
+  const result = await response.json();
+  return result.choices?.[0]?.message?.content || '';
+}
+
+// Structured-output schema for Ollama. With plain format:'json' small local
+// models often answer {"moments":[]}; the schema forces 3-10 real segments.
+const MOMENTS_SCHEMA = {
+  type: 'object',
+  required: ['moments'],
+  properties: {
+    moments: {
+      type: 'array', minItems: 3, maxItems: 10,
+      items: {
+        type: 'object',
+        required: ['id', 'start', 'end', 'title', 'viral_score', 'captions'],
+        properties: {
+          id: { type: 'integer' }, start: { type: 'number' }, end: { type: 'number' },
+          title: { type: 'string' }, viral_score: { type: 'integer' },
+          captions: {
+            type: 'array', minItems: 1,
+            items: {
+              type: 'object', required: ['text', 'start_offset', 'end_offset'],
+              properties: { text: { type: 'string' }, start_offset: { type: 'number' }, end_offset: { type: 'number' } },
+            },
+          },
+        },
+      },
+    },
+  },
+};
+
+async function callOllama(messages, requestedModel) {
+  const models = await listOllamaModels();
+  if (models === null) throw httpError(502, `Ollama tidak jalan di ${OLLAMA_URL}. Jalankan "ollama serve" dulu.`);
+  if (models.length === 0) throw httpError(502, 'Belum ada model Ollama. Jalankan misalnya "ollama pull gemma4:e4b".');
+  const model = requestedModel || (models.includes(OLLAMA_MODEL) ? OLLAMA_MODEL : models[0]);
+  if (!models.includes(model)) throw httpError(400, `Model Ollama "${model}" tidak terpasang.`);
+
+  let response;
+  try {
+    response = await fetch(`${OLLAMA_URL}/api/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model, messages, stream: false, format: MOMENTS_SCHEMA, think: false, options: { temperature: 0.4 } }),
+      signal: AbortSignal.timeout(300000),
+    });
+  } catch (error) {
+    if (error.name === 'TimeoutError') throw httpError(504, `Ollama (${model}) tidak menjawab dalam 5 menit.`);
+    throw httpError(502, `Gagal menghubungi Ollama: ${error.message}`);
+  }
+  if (!response.ok) {
+    const errText = await response.text().catch(() => '');
+    throw httpError(502, `Ollama error ${response.status}: ${errText.slice(0, 300)}`);
+  }
+  const result = await response.json();
+  // Reasoning models may still emit their thinking inline.
+  return String(result.message?.content || '').replace(/<think>[\s\S]*?<\/think>/g, '').trim();
+}
 
 await fsp.mkdir(OUTPUT_DIR, { recursive: true });
 
@@ -364,7 +460,7 @@ const removeDirSafe = async (dirPath) => {
   }
 };
 
-const processJob = async (jobId, videoPath, moments, tempDir) => {
+const processJob = async (jobId, videoPath, moments, tempDir, fields = {}) => {
   const created = [];
   const totalClips = moments.length;
   try {
@@ -389,29 +485,32 @@ const processJob = async (jobId, videoPath, moments, tempDir) => {
       // Default: center crop
       let vf = 'crop=ih*(9/16):ih:(iw-ow)/2:0';
 
-      try {
-        const py = spawnSync('python', [path.join(ROOT_DIR, 'server', 'face_detect.py'), framePath], { encoding: 'utf8', maxBuffer: 10 * 1024 * 1024 });
-        if (py && py.stdout) {
-          try {
-            const info = JSON.parse(py.stdout.trim());
-            if (info && info.face) {
-              const imgW = Number(info.width || 0);
-              const imgH = Number(info.height || 0);
-              const face = info.face;
-              // compute crop width based on image height (same logic as crop=ih*(9/16))
-              const cropW = Math.round(imgH * (9/16));
-              if (imgW > cropW) {
-                let cropX = Math.round(face.cx - cropW / 2);
-                cropX = Math.max(0, Math.min(cropX, imgW - cropW));
-                vf = `crop=${cropW}:${imgH}:${cropX}:0`;
+      // Only attempt face detection if not explicitly disabled by client
+      if (!fields || fields.face_detection !== '0') {
+        try {
+          const py = spawnSync('python', [path.join(ROOT_DIR, 'server', 'face_detect.py'), framePath], { encoding: 'utf8', maxBuffer: 10 * 1024 * 1024 });
+          if (py && py.stdout) {
+            try {
+              const info = JSON.parse(py.stdout.trim());
+              if (info && info.face) {
+                const imgW = Number(info.width || 0);
+                const imgH = Number(info.height || 0);
+                const face = info.face;
+                // compute crop width based on image height (same logic as crop=ih*(9/16))
+                const cropW = Math.round(imgH * (9/16));
+                if (imgW > cropW) {
+                  let cropX = Math.round(face.cx - cropW / 2);
+                  cropX = Math.max(0, Math.min(cropX, imgW - cropW));
+                  vf = `crop=${cropW}:${imgH}:${cropX}:0`;
+                }
               }
+            } catch (e) {
+              // ignore parse errors, keep center crop
             }
-          } catch (e) {
-            // ignore parse errors, keep center crop
           }
+        } catch (err) {
+          // if python call fails, fallback to centered crop
         }
-      } catch (err) {
-        // if python call fails, fallback to centered crop
       }
 
       const args = [
@@ -573,6 +672,22 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  if (req.method === 'GET' && req.url === '/api/ai-providers') {
+    const models = await listOllamaModels();
+    sendJson(res, 200, {
+      ok: true,
+      default: AI_PROVIDER,
+      openrouter: { available: Boolean(OPENROUTER_API_KEY), model: OPENROUTER_MODEL },
+      ollama: {
+        available: models !== null && models.length > 0,
+        running: models !== null,
+        models: models || [],
+        defaultModel: models?.includes(OLLAMA_MODEL) ? OLLAMA_MODEL : (models?.[0] || ''),
+      },
+    });
+    return;
+  }
+
   if (req.method === 'GET' && req.url?.startsWith('/outputs/')) {
     const requested = decodeURIComponent(req.url.replace('/outputs/', ''));
     const safeName = path.basename(requested);
@@ -630,7 +745,7 @@ const server = http.createServer(async (req, res) => {
       const jobId = `job_${++jobCounter}_${Date.now()}`;
 
       jobResults.set(jobId, null); // mark as in-progress
-      processJob(jobId, videoPath, moments, tempDir);
+      processJob(jobId, videoPath, moments, tempDir, fields);
       sendJson(res, 200, { ok: true, jobId });
     } catch (error) {
       if (parsed?.tempDir) {
@@ -638,6 +753,27 @@ const server = http.createServer(async (req, res) => {
       }
       sendJson(res, 500, { ok: false, error: error.message || 'Processing gagal.' });
     }
+    return;
+  }
+
+  if (req.method === 'POST' && req.url === '/api/analyze') {
+    let body = '';
+    req.on('data', chunk => { body += chunk.toString(); });
+    req.on('end', async () => {
+      try {
+        const { systemPrompt, userPrompt, provider, model } = JSON.parse(body);
+        const messages = [
+          { role: 'system', content: String(systemPrompt || '') },
+          { role: 'user', content: String(userPrompt || '') },
+        ];
+        const content = (provider || AI_PROVIDER) === 'ollama'
+          ? await callOllama(messages, model)
+          : await callOpenRouter(messages);
+        sendJson(res, 200, { ok: true, content });
+      } catch (error) {
+        sendJson(res, error.statusCode || 500, { ok: false, error: error.message || 'Analisis AI gagal.' });
+      }
+    });
     return;
   }
 
@@ -667,6 +803,7 @@ const server = http.createServer(async (req, res) => {
   sendJson(res, 404, { ok: false, error: 'Not found' });
 });
 
-server.listen(PORT, () => {
+// Bind to loopback only so other devices on the network cannot use the server (and its API keys).
+server.listen(PORT, '127.0.0.1', () => {
   console.log(`Local FFmpeg server running on http://localhost:${PORT}`);
 });

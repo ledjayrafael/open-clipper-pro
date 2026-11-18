@@ -11,7 +11,7 @@ import {
  */
 
 // Konfigurasi OpenRouter - Masukkan API Key Anda dari openrouter.ai di sini
-const openRouterApiKey = "REMOVED_OPENROUTER_KEY"; 
+const openRouterApiKey = "REMOVED-use-.env"; 
 
 export default function App() {
   const [videoFile, setVideoFile] = useState(null);
